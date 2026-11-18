@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/Autumn-27/artex/db"
-	actool "github.com/Autumn-27/norma/tool"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 // Task credential tools (#3): a per-task record of test accounts. User-declared

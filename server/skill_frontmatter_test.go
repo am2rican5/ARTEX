@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/norma/skill"
+	"github.com/Autumn-27/artex/internal/norma/skill"
 )
 
 func TestYamlScalar(t *testing.T) {

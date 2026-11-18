@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/norma/harness"
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/harness"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 type Parent struct {
@@ -32,15 +32,19 @@ func (p Parent) Key() string {
 	return fmt.Sprintf("task-%d-exp-%d-main", p.TaskID, p.ExplorationID)
 }
 
-// Model contains only configuration identity, never credentials or proxy URLs.
+// Model contains only stable configuration identity and credential references,
+// never credential material, tokens, token revisions, or proxy URLs.
 type Model struct {
-	ProfileID    int64  `json:"profile_id"`
-	Name         string `json:"name"`
-	Format       string `json:"format"`
-	Model        string `json:"model"`
-	Identity     string `json:"identity"`
-	Streaming    bool   `json:"streaming"`
-	WindowTokens int    `json:"window_tokens"`
+	ProfileID             int64  `json:"profile_id"`
+	Name                  string `json:"name"`
+	Format                string `json:"format"`
+	Model                 string `json:"model"`
+	AuthMode              string `json:"auth_mode,omitempty"`
+	CredentialID          int64  `json:"credential_id,omitempty"`
+	AuthBindingGeneration int64  `json:"auth_binding_generation,omitempty"`
+	Identity              string `json:"identity"`
+	Streaming             bool   `json:"streaming"`
+	WindowTokens          int    `json:"window_tokens"`
 }
 
 type Snapshot struct {

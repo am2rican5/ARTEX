@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Autumn-27/artex/internal/norma/llm"
 	"github.com/Autumn-27/artex/llmrec"
-	"github.com/Autumn-27/norma/llm"
 )
 
 // End-to-end through a real norma provider: the Capture rides the context into
@@ -55,7 +55,7 @@ func TestCapturePropagatesThroughNormaProvider(t *testing.T) {
 		APIKey:  "test-key",
 		Model:   "claude-test",
 	}
-	prov, err := cfg.NewProvider()
+	prov, err := cfg.NewProvider(nil)
 	if err != nil {
 		t.Fatalf("NewProvider: %v", err)
 	}

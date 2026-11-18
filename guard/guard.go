@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/norma/hook"
+	"github.com/Autumn-27/artex/internal/norma/hook"
 )
 
 // AuditEntry records one gated tool call.

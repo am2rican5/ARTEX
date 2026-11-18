@@ -86,7 +86,14 @@ func run() int {
 	if err != nil {
 		log.Fatalf("open stores: %v", err)
 	}
-	defer mgr.Close()
+	managerClosed := false
+	defer func() {
+		if !managerClosed {
+			if closeErr := mgr.Close(); closeErr != nil {
+				log.Printf("close stores: %v", closeErr)
+			}
+		}
+	}()
 
 	skillDir, err := config.SkillDir()
 	if err != nil {
@@ -127,9 +134,25 @@ func run() int {
 	<-ctx.Done()
 
 	log.Println("shutting down...")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_ = httpSrv.Shutdown(shutdownCtx)
+	cancel()
+	taskDrainCtx, cancelTaskDrain := context.WithTimeout(context.Background(), 30*time.Second)
+	taskDrainErr := srv.DrainTaskRuntimes(taskDrainCtx)
+	cancelTaskDrain()
+	if taskDrainErr != nil {
+		// A timed-out task runtime may still be persisting its final state. Leave
+		// PostgreSQL open rather than racing that commit with Manager.Close.
+		managerClosed = true
+		log.Printf("drain task runtimes: %v", taskDrainErr)
+		return 1
+	}
+	closeErr := mgr.Close()
+	managerClosed = true
+	if closeErr != nil {
+		log.Printf("close stores: %v", closeErr)
+		return 1
+	}
 	return 0
 }
 

@@ -2,15 +2,16 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"iter"
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/norma/agentcore"
-	"github.com/Autumn-27/norma/harness"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/noaadapter"
+	"github.com/Autumn-27/artex/internal/norma/agentcore"
+	"github.com/Autumn-27/artex/internal/norma/harness"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/noaadapter"
 )
 
 // A worker whose protected context exceeds a tiny NOA window ends with
@@ -151,5 +152,82 @@ func TestEnableNoaFailureKeepsBuiltInCompaction(t *testing.T) {
 	}
 	if opts.Provider != llm.Provider(inner) {
 		t.Fatalf("provider %T was wrapped although noa is off", opts.Provider)
+	}
+}
+
+type nativeContextProvider struct {
+	state *llm.ProviderState
+	err   error
+}
+
+func (p nativeContextProvider) Stream(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return func(yield func(llm.StreamEvent, error) bool) {
+		for _, event := range []llm.StreamEvent{
+			{Type: llm.SEMessageStart, Usage: llm.Usage{InputTokens: 21}},
+			{Type: llm.SEToolUseStart, ToolID: "a", ToolName: "read"},
+			{Type: llm.SEToolUseStart, ToolID: "b", ToolName: "read"},
+			{Type: llm.SEToolInputJSON, ToolID: "b", Text: `{"n":2}`},
+			{Type: llm.SEToolInputJSON, ToolID: "a", Text: `{"n":1}`},
+			{Type: llm.SEProviderState, ProviderState: p.state},
+			{Type: llm.SEMessageDelta, StopReason: "tool_use", Usage: llm.Usage{OutputTokens: 6}},
+			{Type: llm.SEMessageStop},
+		} {
+			if !yield(event, nil) {
+				return
+			}
+		}
+	}
+}
+
+func (p nativeContextProvider) Complete(context.Context, llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("partial")}, ProviderState: p.state}, "", llm.Usage{InputTokens: 9, OutputTokens: 2}, p.err
+}
+
+func TestNativeContextSurvivesNoaBudgetAndProjection(t *testing.T) {
+	state := &llm.ProviderState{
+		Provider:  "openai-codex-oauth",
+		Model:     "codex-native",
+		AuthScope: "account:workspace",
+		Data:      json.RawMessage(`{"version":1,"reasoning":[{"id":"r1"}]}`),
+	}
+	wantErr := errors.New("native terminal failure")
+	p := &noaBudgetProvider{Provider: nativeContextProvider{state: state, err: wantErr}, window: 32000}
+	acc := llm.NewAccumulator()
+	for event, err := range p.Stream(t.Context(), llm.CompletionRequest{Messages: []llm.Message{llm.UserText("short")}}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		acc.Add(event)
+	}
+	streamed := acc.Message()
+	uses := streamed.ToolUses()
+	if len(uses) != 2 || string(uses[0].Input) != `{"n":1}` || string(uses[1].Input) != `{"n":2}` {
+		t.Fatalf("NOA budget wrapper lost explicit tool IDs: %+v", uses)
+	}
+	if streamed.ProviderState == nil || string(streamed.ProviderState.Data) != string(state.Data) || acc.Usage != (llm.Usage{InputTokens: 21, OutputTokens: 6}) {
+		t.Fatalf("NOA budget wrapper lost state/usage: message=%+v usage=%+v", streamed, acc.Usage)
+	}
+	atomic, stop, usage, err := p.Complete(t.Context(), llm.CompletionRequest{Messages: []llm.Message{llm.UserText("short")}})
+	if !errors.Is(err, wantErr) || stop != "" || usage != (llm.Usage{InputTokens: 9, OutputTokens: 2}) || atomic.ProviderState == nil {
+		t.Fatalf("atomic metadata changed: message=%+v stop=%q usage=%+v err=%v", atomic, stop, usage, err)
+	}
+
+	original := []llm.Message{
+		llm.UserText("question"),
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("original answer")}, ProviderState: state},
+	}
+	cores, sidecar := noaadapter.Project(original)
+	roundTrip := noaadapter.Reassemble(cores, original, sidecar, noaadapter.ReassembleOptions{})
+	if len(roundTrip) != 2 || roundTrip[1].ProviderState == nil || string(roundTrip[1].ProviderState.Data) != string(state.Data) {
+		t.Fatalf("unchanged NOA projection lost provider state: %+v", roundTrip)
+	}
+	roundTrip[1].ProviderState.Data[0] = '['
+	if state.Data[0] != '{' {
+		t.Fatal("NOA projection aliases original provider state")
+	}
+	cores[1].Text = "compressed answer"
+	transformed := noaadapter.Reassemble(cores, original, sidecar, noaadapter.ReassembleOptions{})
+	if len(transformed) != 2 || transformed[1].Text() != "compressed answer" || transformed[1].ProviderState != nil {
+		t.Fatalf("transformed NOA message retained stale provider state: %+v", transformed)
 	}
 }

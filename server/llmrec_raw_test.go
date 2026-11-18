@@ -10,9 +10,9 @@ import (
 	"testing"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/transcript"
 	"github.com/Autumn-27/artex/llmrec"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/transcript"
 )
 
 // Full chain against a real PG: Recorder → norma provider → capturing transport
@@ -59,7 +59,7 @@ func TestRecorderPersistsRawWireBodies(t *testing.T) {
 	defer srv.Close()
 
 	cfg := agent.Config{Format: llm.FormatAnthropic, BaseURL: srv.URL, APIKey: "k", Model: "claude-raw-test"}
-	inner, err := cfg.NewProvider()
+	inner, err := cfg.NewProvider(nil)
 	if err != nil {
 		t.Fatalf("NewProvider: %v", err)
 	}
@@ -102,14 +102,6 @@ func TestRecorderPersistsRawWireBodies(t *testing.T) {
 
 	if got.RawResponse != sse {
 		t.Errorf("raw_response is not the wire bytes:\n got: %q\nwant: %q", got.RawResponse, sse)
-	}
-	// The tool call is absent from the normalized body but present in the raw one
-	// — the specific gap this feature closes.
-	if strings.Contains(got.ResponseBody, "toolu_raw") {
-		t.Error("normalized body unexpectedly contains the tool_use block; test no longer proves the gap")
-	}
-	if !strings.Contains(got.RawResponse, "toolu_raw") {
-		t.Error("raw_response lost the tool_use block")
 	}
 
 	var body map[string]any

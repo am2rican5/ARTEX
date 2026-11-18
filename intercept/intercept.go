@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/subscription"
 )
 
 // ctxKey is the unexported context key type to avoid collisions.
@@ -58,6 +59,7 @@ type taskCtxInfo struct{ taskID, agentName string }
 // HandleAsk can tag pending records and write intercept_request activities to
 // the task's exploration stream (making them appear inline in session transcripts).
 func WithTaskContext(ctx context.Context, taskID, agentName string, emit func(db.Activity)) context.Context {
+	ctx = subscription.WithTaskScope(ctx, taskID)
 	ctx = context.WithValue(ctx, taskInfoCtxKey, taskCtxInfo{taskID, agentName})
 	if emit != nil {
 		ctx = context.WithValue(ctx, taskEmitCtxKey, emit)

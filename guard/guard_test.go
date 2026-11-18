@@ -10,7 +10,7 @@ import (
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/norma/hook"
+	"github.com/Autumn-27/artex/internal/norma/hook"
 )
 
 // A guard with no interceptor no longer hard-blocks anything: destructive/exfil

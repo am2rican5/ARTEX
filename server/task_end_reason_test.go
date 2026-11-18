@@ -40,13 +40,13 @@ func TestReviveClearsBudgetEndReason(t *testing.T) {
 		t.Fatalf("after budget settle end_reason=%q", r)
 	}
 	// A same-status admission (no revive) keeps the reason.
-	if err := m.ApplyTaskAdmission(task.ID, "timeout", "timeout", false, "resume", false); err != nil {
+	if err := m.ApplyTaskAdmission(task.ID, "timeout", "timeout", false, "resume", false, false); err != nil {
 		t.Fatal(err)
 	}
 	if r := endReason(); r != db.EndReasonBudget {
 		t.Fatalf("terminal admission dropped end_reason: %q", r)
 	}
-	if err := m.ApplyTaskAdmission(task.ID, "timeout", "running", false, "resume", false); err != nil {
+	if err := m.ApplyTaskAdmission(task.ID, "timeout", "running", false, "resume", false, false); err != nil {
 		t.Fatal(err)
 	}
 	if r := endReason(); r != "" {

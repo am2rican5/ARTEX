@@ -7,7 +7,7 @@ import (
 
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/intercept"
-	actool "github.com/Autumn-27/norma/tool"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 // withWebFetch returns tools plus the WebFetch tool of an agent session. Every

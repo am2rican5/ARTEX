@@ -367,6 +367,22 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS llm_credentials (
+    id         BIGSERIAL PRIMARY KEY,
+    provider   TEXT NOT NULL CHECK (provider IN ('anthropic-oauth','openai-codex-oauth')),
+    label      TEXT NOT NULL CHECK (btrim(label) <> ''),
+    status     TEXT NOT NULL DEFAULT 'ready'
+               CHECK (status IN ('ready','reauth_required','revoked')),
+    revision   BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+    generation BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0),
+    payload    JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+DROP TRIGGER IF EXISTS trg_llm_credentials_upd ON llm_credentials;
+CREATE TRIGGER trg_llm_credentials_upd BEFORE UPDATE ON llm_credentials
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
 CREATE TABLE IF NOT EXISTS llm_profiles (
     id               BIGSERIAL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
@@ -376,6 +392,9 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     model            TEXT NOT NULL,
     api_key          TEXT,
     api_key_hint     TEXT,
+    auth_mode        TEXT NOT NULL DEFAULT 'api_key',
+    credential_id    BIGINT REFERENCES llm_credentials(id) ON DELETE RESTRICT,
+    auth_binding_generation BIGINT NOT NULL DEFAULT 0,
     rate_per_second  DOUBLE PRECISION NOT NULL DEFAULT 0,
     rate_per_minute  DOUBLE PRECISION NOT NULL DEFAULT 0,
     context_window_k INTEGER NOT NULL DEFAULT 0,
@@ -392,7 +411,7 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     -- streaming=true (default) uses streaming SSE; false uses true non-streaming (stream:false, one-shot JSON).
     streaming        BOOLEAN NOT NULL DEFAULT true,
     -- Output cap (tokens) for a single reply. 0=do not send the field; the server default decides — preserves existing behavior.
-    -- Different from context_window_k (total model capacity, used only locally for the compression threshold): this value is sent with the request.
+    -- Different from context_window_k (total model capacity, used only locally to size the compression threshold): this value is sent with every request.
     max_tokens       INTEGER NOT NULL DEFAULT 0,
     -- Which request field name carries the output cap; only applies to format='openai':
     --   ''                      = max_tokens (default, compatible with most gateways)
@@ -414,12 +433,93 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     retry_stream_attempts     INTEGER NOT NULL DEFAULT 0,
     retry_stream_interval_ms  INTEGER NOT NULL DEFAULT 0,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT llm_profiles_auth_binding_check CHECK (
+        (auth_mode='api_key' AND credential_id IS NULL)
+        OR (auth_mode='oauth' AND credential_id IS NOT NULL AND api_key IS NULL)
+    ),
+    CONSTRAINT llm_profiles_auth_mode_check CHECK (auth_mode IN ('api_key','oauth')),
+    CONSTRAINT llm_profiles_auth_binding_generation_check CHECK (auth_binding_generation >= 0)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_one_default ON llm_profiles(is_default) WHERE is_default;
 DROP TRIGGER IF EXISTS trg_llm_upd ON llm_profiles;
 CREATE TRIGGER trg_llm_upd BEFORE UPDATE ON llm_profiles
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Native OAuth profile binding. Existing profiles stay in api_key mode and
+-- preserve their key. The credential reference is restrictive so deleting an
+-- account can never silently turn a selected profile into an API-key fallback.
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS auth_mode TEXT NOT NULL DEFAULT 'api_key';
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS credential_id BIGINT;
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS auth_binding_generation BIGINT NOT NULL DEFAULT 0;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid='llm_profiles'::regclass
+          AND conname='llm_profiles_credential_id_fkey'
+    ) THEN
+        ALTER TABLE llm_profiles ADD CONSTRAINT llm_profiles_credential_id_fkey
+            FOREIGN KEY (credential_id) REFERENCES llm_credentials(id) ON DELETE RESTRICT;
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_llm_profiles_credential
+    ON llm_profiles(credential_id) WHERE credential_id IS NOT NULL;
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_auth_mode_check;
+ALTER TABLE llm_profiles ADD CONSTRAINT llm_profiles_auth_mode_check
+    CHECK (auth_mode IN ('api_key','oauth'));
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_auth_binding_generation_check;
+ALTER TABLE llm_profiles ADD CONSTRAINT llm_profiles_auth_binding_generation_check
+    CHECK (auth_binding_generation >= 0);
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_auth_binding_check;
+ALTER TABLE llm_profiles ADD CONSTRAINT llm_profiles_auth_binding_check CHECK (
+    (auth_mode='api_key' AND credential_id IS NULL)
+    OR (auth_mode='oauth' AND credential_id IS NOT NULL AND api_key IS NULL)
+);
+
+CREATE OR REPLACE FUNCTION validate_llm_profile_auth() RETURNS trigger AS $$
+DECLARE credential_provider TEXT;
+BEGIN
+    IF NEW.auth_mode = 'api_key' THEN
+        RETURN NEW;
+    END IF;
+    SELECT provider INTO credential_provider
+      FROM llm_credentials WHERE id=NEW.credential_id FOR KEY SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'LLM credential % does not exist', NEW.credential_id
+            USING ERRCODE='foreign_key_violation';
+    END IF;
+    IF NOT ((credential_provider='anthropic-oauth' AND NEW.format='anthropic')
+            OR (credential_provider='openai-codex-oauth' AND NEW.format='openai-responses')) THEN
+        RAISE EXCEPTION 'LLM credential provider % is incompatible with profile format %',
+            credential_provider, NEW.format USING ERRCODE='check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_llm_profiles_auth ON llm_profiles;
+CREATE TRIGGER trg_llm_profiles_auth
+    BEFORE INSERT OR UPDATE OF auth_mode,credential_id,format,api_key ON llm_profiles
+    FOR EACH ROW EXECUTE FUNCTION validate_llm_profile_auth();
+
+CREATE OR REPLACE FUNCTION validate_llm_credential_provider() RETURNS trigger AS $$
+BEGIN
+    IF NEW.provider IS DISTINCT FROM OLD.provider AND EXISTS (
+        SELECT 1 FROM llm_profiles p
+        WHERE p.credential_id=NEW.id
+          AND NOT ((NEW.provider='anthropic-oauth' AND p.format='anthropic')
+                   OR (NEW.provider='openai-codex-oauth' AND p.format='openai-responses'))
+    ) THEN
+        RAISE EXCEPTION 'LLM credential provider % is incompatible with a bound profile', NEW.provider
+            USING ERRCODE='check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_llm_credentials_provider ON llm_credentials;
+CREATE TRIGGER trg_llm_credentials_provider
+    BEFORE UPDATE OF provider ON llm_credentials
+    FOR EACH ROW EXECUTE FUNCTION validate_llm_credential_provider();
 -- Rotation order/exclusion flags; backfills old databases. Default 0 / false = every profile joins the rotation.
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS priority     INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS pool_exclude BOOLEAN NOT NULL DEFAULT false;
@@ -541,6 +641,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300,
     plan_quiet_mode BOOLEAN NOT NULL DEFAULT true,
     coverage_enabled BOOLEAN NOT NULL DEFAULT true,
+    native_used BOOLEAN NOT NULL DEFAULT false,
+    native_recovery_hold BOOLEAN NOT NULL DEFAULT false,
     pinned_at      TIMESTAMPTZ,
     first_run_at   TIMESTAMPTZ,
     deadline_at    TIMESTAMPTZ,
@@ -583,6 +685,10 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS active_llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS llm_chain_revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+-- A sticky native-use marker is separate from the recovery hold established
+-- only when startup or lease recovery finds unfinished native work.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS native_used BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS native_recovery_hold BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category_id, created_at DESC)
     WHERE deleted_at IS NULL AND category_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_pinned ON tasks(pinned_at DESC)

@@ -21,9 +21,9 @@ import (
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/internal/norma/permission"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 	"github.com/Autumn-27/artex/notify"
-	"github.com/Autumn-27/norma/permission"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 // This file implements the custom tool executor (docs/custom-tool-design.md). tools rows

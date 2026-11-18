@@ -87,6 +87,20 @@ does not reset it; the profile order and switch remain persisted.
 The task creation and `PUT /api/tasks/{id}/llm` APIs accept `llm_rotate: true` alongside
 the ordered `llm_profile_ids`. Omitting `llm_rotate` on an update preserves its value.
 
+### Experimental native subscriptions
+
+ARTEX also has opt-in, experimental native Go profiles for Claude
+(`anthropic-oauth`) and ChatGPT/Codex (`openai-codex-oauth`). They do not run
+OMP, Bun, Claude CLI or Codex CLI; see [Native subscription profiles](docs/native-subscriptions.md)
+for setup, callback and deployment details. Existing API-key and Ollama profiles
+are unchanged.
+
+Before enabling a subscription profile, confirm the provider's terms, account
+ownership, model entitlement, usage limits and any additional-usage setting.
+Authentication, consent or account-limit failures do not automatically fall
+back to a paid API or another account. The Codex flow translates a pinned legacy
+OMP protocol; ARTEX does not claim official Sign in with ChatGPT (SIWC) support.
+
 ## Screenshots
 
 | Tasks | Findings |

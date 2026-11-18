@@ -10,7 +10,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/noaadapter"
 )
 
 // Memory is independent of the main snapshot. Through is a persisted ordinal,
@@ -233,9 +234,12 @@ func (b *contextBuilder) compactSnapshot(ctx context.Context, base []llm.Message
 	if b.memory.SnapshotKey == key && b.memory.TailStart == start && b.memory.SnapshotSummary != "" {
 		return snapshotSummaryMessages(b.memory.SnapshotSummary, base[start:]), nil
 	}
-	// Serialize only the portion being summarized. The retained suffix stays
-	// in norma's structured message representation, including signed thinking.
-	data, err := json.Marshal(base[:start])
+	// Project the summarized prefix through Norma's canonical message projector.
+	// ProviderState is replay metadata for an unchanged original turn; it must
+	// never be converted into visible summary material or cross the compaction
+	// boundary after that turn is replaced.
+	projected, _ := noaadapter.Project(base[:start])
+	data, err := json.Marshal(projected)
 	if err != nil {
 		return nil, err
 	}

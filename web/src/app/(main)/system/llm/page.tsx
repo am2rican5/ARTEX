@@ -3,6 +3,7 @@
 import * as React from "react";
 
 import {
+  AlertCircleIcon,
   Loader2Icon,
   PlugZapIcon,
   PlusIcon,
@@ -16,6 +17,7 @@ import {
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -27,9 +29,19 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
+import type {
+  LLMAuthMode,
+  LLMCredential,
+  LLMCredentialProvider,
+  LLMModelCatalogEntry,
+  LLMPoolMember,
+  LLMPoolStatus,
+  LLMProfile,
+  LLMRetryOverride,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+import { AccountsPanel } from "./_components/accounts";
 import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_components/retry";
 import { setVisibleInterval } from "@/lib/polling";
 
@@ -55,7 +67,8 @@ const MAX_TOKENS_FIELD_HINTS: Record<string, string> = {
   openai:
     "Which key carries the cap. max_tokens is the default and the vast majority of compatible gateways only accept it; OpenAI's official reasoning models (the o series / GPT-5) conversely only accept max_completion_tokens and fail outright with unsupported_parameter when they receive max_tokens.",
   anthropic: "Only selectable for the openai format. Anthropic's field name is fixed as max_tokens.",
-  "openai-responses": "Only selectable for the openai format. The Responses API's field name is fixed as max_output_tokens.",
+  "openai-responses":
+    "Only selectable for the openai format. The Responses API's field name is fixed as max_output_tokens.",
   ollama: "Only selectable for the openai format. Ollama's field name is fixed as max_tokens.",
 };
 // LLM profile formats. The default in the create form is "anthropic"; "ollama" is the
@@ -70,6 +83,18 @@ const EFFORT_LEVELS: { value: string; label: string }[] = [
   { value: "xhigh", label: "xhigh" },
   { value: "max", label: "max" },
 ];
+const MANAGED_NATIVE: Record<LLMCredentialProvider, { format: ProfileFormat; endpoint: string; userAgent: string }> = {
+  "anthropic-oauth": {
+    format: "anthropic",
+    endpoint: "https://api.anthropic.com/v1/messages?beta=true",
+    userAgent: "claude-cli/2.1.321 (external, cli)",
+  },
+  "openai-codex-oauth": {
+    format: "openai-responses",
+    endpoint: "https://chatgpt.com/backend-api/codex/responses",
+    userAgent: "artex/1",
+  },
+};
 
 function cooldownText(secs: number) {
   if (secs <= 0) return "";
@@ -77,12 +102,38 @@ function cooldownText(secs: number) {
   return `${Math.ceil(secs / 60)}min`;
 }
 
-// The "healthy or not" badge a profile shows on its card. A profile without a Key cannot send any request at all — say that before the breaker;
-// the exception is Ollama, a keyless local server that IS callable without a key. The other states come from the pool's breaker
-// records (with polling off no new records appear, so "healthy" = no known failure).
+// Profile cards report credential readiness separately from the pool breaker.
+// Native "session stored" never implies model entitlement, quota, balance, or billing.
 type Health = { label: string; cls: string; hint?: string };
-function healthOf(p: LLMProfile, m?: LLMPoolMember): Health {
-  if (!p.api_key_hint && p.format !== "ollama") {
+function healthOf(p: LLMProfile, m?: LLMPoolMember, credential?: LLMCredential): Health {
+  if ((p.auth_mode ?? "api_key") === "oauth") {
+    if (!p.credential_id) {
+      return {
+        label: "No account selected",
+        cls: "border-destructive/50 text-destructive",
+        hint: "Select a connected account before using this profile",
+      };
+    }
+    if (!credential) {
+      return {
+        label: "Account unavailable",
+        cls: "border-destructive/50 text-destructive",
+        hint: "The selected account could not be found",
+      };
+    }
+    if (credential.status === "reauth_required") {
+      return {
+        label: "Reauth required",
+        cls: "border-amber-500/50 text-amber-600 dark:text-amber-400",
+      };
+    }
+    if (credential.status === "revoked") {
+      return {
+        label: "Disconnected",
+        cls: "border-muted-foreground/40 text-muted-foreground",
+      };
+    }
+  } else if (!p.api_key_hint && p.format !== "ollama") {
     return {
       label: "No Key configured",
       cls: "border-muted-foreground/40 text-muted-foreground",
@@ -101,6 +152,13 @@ function healthOf(p: LLMProfile, m?: LLMPoolMember): Health {
       label: `Degraded · failed ${m.fails} times`,
       cls: "border-amber-500/50 text-amber-600 dark:text-amber-400",
       hint: m.last_error,
+    };
+  }
+  if ((p.auth_mode ?? "api_key") === "oauth") {
+    return {
+      label: "Session stored",
+      cls: "border-emerald-500/50 text-emerald-600 dark:text-emerald-400",
+      hint: "Stored session only; model access and quota are checked when used",
     };
   }
   return { label: "Healthy", cls: "border-emerald-500/50 text-emerald-600 dark:text-emerald-400" };
@@ -166,14 +224,14 @@ function PoolSheet({
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="right" className="flex flex-col gap-0 p-0 data-[side=right]:sm:max-w-lg">
+      <SheetContent side="right" className="flex w-full flex-col gap-0 p-0 data-[side=right]:sm:max-w-lg">
         <SheetHeader className="px-4">
           <SheetTitle className="flex items-center gap-2">
             <ZapIcon className="size-4" /> LLM Pool · Failover
           </SheetTitle>
           <SheetDescription>
-            When enabled, an Agent <b>without a pinned model</b> automatically fails over to the next config when the current one is unusable (insufficient balance / dead Key / rate limiting /
-            service error).
+            When enabled, an Agent <b>without a pinned model</b> automatically fails over to the next config when the
+            current one is unusable (insufficient balance / dead Key / rate limiting / service error).
           </SheetDescription>
         </SheetHeader>
 
@@ -181,7 +239,9 @@ function PoolSheet({
           <div className="flex items-center justify-between gap-4 rounded-lg border p-3">
             <div className="grid gap-0.5">
               <Label className="text-sm">Enable pool</Label>
-              <p className="text-muted-foreground text-xs">Off by default. When off, only the active profile is ever used and a failure stays a failure.</p>
+              <p className="text-muted-foreground text-xs">
+                Off by default. When off, only the active profile is ever used and a failure stays a failure.
+              </p>
             </div>
             <Switch
               checked={enabled}
@@ -197,8 +257,9 @@ function PoolSheet({
                 <div className="grid gap-0.5">
                   <Label className="text-sm">Also fall back when a pinned config fails</Label>
                   <p className="text-muted-foreground text-xs">
-                    Off by default: when an Agent or task pins a config, only that config is used and a failure stays a failure (no silent switch to another model).
-                    When enabled, a failing pinned config also falls back to the pool chain below.
+                    Off by default: when an Agent or task pins a config, only that config is used and a failure stays a
+                    failure (no silent switch to another model). When enabled, a failing pinned config also falls back
+                    to the pool chain below.
                   </p>
                 </div>
                 <Switch
@@ -222,8 +283,8 @@ function PoolSheet({
                 </div>
                 {inChain.length < 2 && (
                   <p className="text-muted-foreground text-xs">
-                    Only {inChain.length} usable profile(s) right now, so the pool has no effect — at least 2 usable profiles (API Key set, or Ollama) with pool participation are
-                    required.
+                    Only {inChain.length} participating profile(s) are in the chain, so the pool has no effect — at
+                    least 2 configured profiles with pool participation are required.
                   </p>
                 )}
                 {chain.map((m) => {
@@ -251,7 +312,9 @@ function PoolSheet({
                         {excluded && <Badge variant="outline">Excluded from pool</Badge>}
                         <div className="ml-auto flex items-center gap-2">
                           {m.state === "tripped" && m.cooldown_secs > 0 && (
-                            <span className="text-muted-foreground text-xs">Cooldown {cooldownText(m.cooldown_secs)}</span>
+                            <span className="text-muted-foreground text-xs">
+                              Cooldown {cooldownText(m.cooldown_secs)}
+                            </span>
                           )}
                           {m.state === "degraded" && (
                             <span className="text-muted-foreground text-xs">{m.fails} consecutive failures</span>
@@ -290,9 +353,10 @@ function PoolSheet({
               </div>
 
               <div className="rounded-lg border border-dashed p-3 text-muted-foreground text-xs leading-relaxed">
-                The active profile is always first; the rest follow priority from high to low (set per profile). After a failure a profile enters a cooldown (60s → 5min →
-                30min), is skipped while cooling down, and switches back automatically once recovered. Profiles whose context window cannot fit the current request are skipped. Agents
-                and tasks with a pinned model do not join the pool by default.
+                The active profile is always first; the rest follow priority from high to low (set per profile). After a
+                failure a profile enters a cooldown (60s → 5min → 30min), is skipped while cooling down, and switches
+                back automatically once recovered. Profiles whose context window cannot fit the current request are
+                skipped. Agents and tasks with a pinned model do not join the pool by default.
               </div>
             </>
           )}
@@ -308,16 +372,22 @@ function PoolSheet({
 
 function ProfileSheet({
   profile,
+  credentials,
+  credentialsError,
   open,
   onOpenChange,
   onSaved,
 }: {
   profile: LLMProfile | null; // null = create
+  credentials: LLMCredential[];
+  credentialsError: string;
   open: boolean;
   onOpenChange: (o: boolean) => void;
   onSaved: (id: string) => void;
 }) {
   const isNew = !profile;
+  const [authMode, setAuthMode] = React.useState<LLMAuthMode>("api_key");
+  const [credentialID, setCredentialID] = React.useState("");
   const [name, setName] = React.useState("");
   const [format, setFormat] = React.useState<ProfileFormat>("anthropic");
   const [model, setModel] = React.useState("");
@@ -340,7 +410,7 @@ function ProfileSheet({
   const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // retry override for this profile; all 0 = follow the global
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
-  const [models, setModels] = React.useState<string[]>([]);
+  const [models, setModels] = React.useState<Array<string | LLMModelCatalogEntry>>([]);
   const [loadingModels, setLoadingModels] = React.useState(false);
   const [modelsOpen, setModelsOpen] = React.useState(false);
 
@@ -348,6 +418,8 @@ function ProfileSheet({
   // the drawer is a clean start, leaving no leftovers from the previous profile.
   React.useEffect(() => {
     if (!open) return;
+    setAuthMode(profile?.auth_mode ?? "api_key");
+    setCredentialID(profile?.credential_id ? String(profile.credential_id) : "");
     setName(profile?.name ?? "");
     setFormat(
       profile?.format === "openai" || profile?.format === "openai-responses" || profile?.format === "ollama"
@@ -377,17 +449,109 @@ function ProfileSheet({
   }, [open, profile]);
 
   const profileId = profile ? Number(profile.id) : undefined;
+  const credentialIDNumber = Number(credentialID);
+  const hasCredentialSelection = Number.isInteger(credentialIDNumber) && credentialIDNumber > 0;
+  const selectedCredential = credentials.find((credential) => credential.id === credentialIDNumber);
+  const storedNativeSelection =
+    profile?.auth_mode === "oauth" && profile.credential_id === credentialIDNumber && profileId !== undefined;
+  const selectedNativeProvider: LLMCredentialProvider | undefined =
+    selectedCredential?.provider ??
+    (storedNativeSelection
+      ? format === "anthropic"
+        ? "anthropic-oauth"
+        : format === "openai-responses"
+          ? "openai-codex-oauth"
+          : undefined
+      : undefined);
+  const managedNative = selectedNativeProvider ? MANAGED_NATIVE[selectedNativeProvider] : undefined;
+  const selectedCatalog = models.find(
+    (entry): entry is LLMModelCatalogEntry => typeof entry !== "string" && entry.id === model,
+  );
+  const existingNativeModel = profile?.auth_mode === "oauth" && profile.model === model;
+  const outputCapSupported =
+    authMode !== "oauth" ||
+    selectedCatalog?.supports_output_cap === true ||
+    (existingNativeModel && (profile.max_tokens ?? 0) > 0);
+  const supportsThinkingDisable =
+    authMode !== "oauth" ||
+    selectedCatalog?.supports_thinking_disable === true ||
+    (existingNativeModel && profile.thinking_type === "disabled");
+  const thinkingOptions = supportsThinkingDisable
+    ? THINKING_TYPES
+    : THINKING_TYPES.filter((option) => option.value !== "disabled");
+  const effortOptions = selectedCatalog?.reasoning_efforts?.length
+    ? [
+        { value: NONE, label: "Not sent (default)" },
+        ...selectedCatalog.reasoning_efforts.map((value) => ({ value, label: value })),
+      ]
+    : authMode === "oauth"
+      ? profile?.reasoning_effort && existingNativeModel
+        ? [
+            { value: NONE, label: "Not sent (default)" },
+            { value: profile.reasoning_effort, label: profile.reasoning_effort },
+          ]
+        : [{ value: NONE, label: "Not sent (load catalog for options)" }]
+      : EFFORT_LEVELS;
+
+  function changeAuthMode(next: LLMAuthMode) {
+    setAuthMode(next);
+    setCredentialID("");
+    setModels([]);
+    setModelsOpen(false);
+    if (next === "oauth") {
+      setBaseUrl("");
+      setApiKey("");
+      setKeyHint("");
+      setUserAgent("");
+      setCw("0");
+      setSessionHeaderKey("");
+      setMaxTokens("0");
+      setMaxTokensField(NONE);
+      setThinkingType(NONE);
+      setEffort(NONE);
+      setPoolExclude(true);
+    }
+  }
+
+  function selectCredential(value: string) {
+    setCredentialID(value);
+    const credential = credentials.find((item) => String(item.id) === value);
+    if (credential) setFormat(MANAGED_NATIVE[credential.provider].format);
+    setModel("");
+    setModels([]);
+    setModelsOpen(false);
+    setThinkingType(NONE);
+    setEffort(NONE);
+    setMaxTokens("0");
+    setMaxTokensField(NONE);
+  }
 
   async function loadModels() {
     if (loadingModels) return;
+    if (authMode === "oauth" && !hasCredentialSelection) {
+      toast.error("Select a connected account before loading the native catalog");
+      return;
+    }
     setLoadingModels(true);
     setModels([]);
     try {
-      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
+      const r = await api.fetchLLMModels({
+        provider: format,
+        auth_mode: authMode,
+        ...(authMode === "oauth"
+          ? storedNativeSelection
+            ? { profile_id: profileId }
+            : { credential_id: credentialIDNumber }
+          : { base_url: baseUrl, api_key: apiKey, proxy, profile_id: profileId }),
+      });
       if (r.ok && r.models && r.models.length > 0) {
         setModels(r.models);
         setModelsOpen(true);
-        toast.success(`Loaded ${r.models.length} models`);
+        toast.success(
+          authMode === "oauth"
+            ? `Loaded ${r.models.length} pinned catalog candidates`
+            : `Loaded ${r.models.length} models`,
+        );
       } else {
         toast.error(`Failed to load models: ${r.error ?? "no models returned"}`);
       }
@@ -400,26 +564,34 @@ function ProfileSheet({
 
   async function testConnection() {
     if (testing) return;
+    if (authMode === "oauth" && !hasCredentialSelection) {
+      toast.error("Select an account before testing this profile");
+      return;
+    }
     setTesting(true);
     try {
-      // Test with the thinking parameters the profile would actually run, so a model that does not support the field fails here,
-      // not when a task is already running. Pass the profile id: with the Key input left empty, the stored Key is used.
-      const r = await api.testLLM(
-        format,
+      const r = await api.testLLM({
+        provider: format,
         model,
-        baseUrl,
-        apiKey,
+        auth_mode: authMode,
+        ...(authMode === "oauth"
+          ? storedNativeSelection
+            ? { profile_id: profileId }
+            : { credential_id: credentialIDNumber }
+          : {
+              profile_id: profileId,
+              base_url: baseUrl,
+              api_key: apiKey,
+              session_header_key: sessionHeaderKey.trim(),
+              user_agent: userAgent.trim(),
+            }),
         proxy,
-        toStore(thinkingType),
-        toStore(effort),
-        profileId,
+        thinking_type: toStore(thinkingType),
+        reasoning_effort: toStore(effort),
         streaming,
-        sessionHeaderKey.trim(),
-        userAgent.trim(),
-      );
-      // Show the reply too: only when the model demonstrably spoke is this the same as working inside a session.
+      });
       if (r.ok)
-        toast.success(`Connected · ${r.latency_ms ?? "?"}ms · ${r.model ?? model}`, {
+        toast.success(`Model check passed · ${r.latency_ms ?? "?"}ms · ${r.model ?? model}`, {
           description: r.reply ? `Reply: ${r.reply}` : undefined,
         });
       else toast.error(`Connection failed: ${r.error ?? "unknown"}`);
@@ -435,17 +607,28 @@ function ProfileSheet({
       toast.error("Please fill in a name and a model");
       return;
     }
+    if (authMode === "oauth" && !hasCredentialSelection) {
+      toast.error("Select a connected account for this native profile");
+      return;
+    }
+    if (!supportsThinkingDisable && thinkingType === "disabled") {
+      toast.error("This native model does not support turning reasoning fully off");
+      return;
+    }
     if (saving) return;
     setSaving(true);
     try {
+      const native = authMode === "oauth";
       const { id } = await api.saveLLMProfile({
         ...(profile ? { id: Number(profile.id) } : {}),
+        auth_mode: authMode,
+        credential_id: native ? credentialIDNumber : profile?.auth_mode === "oauth" ? null : undefined,
         name: name.trim(),
         format,
         model: model.trim(),
-        base_url: baseUrl.trim(),
+        base_url: native ? "" : baseUrl.trim(),
         proxy: proxy.trim(),
-        api_key: apiKey,
+        api_key: native ? "" : apiKey,
         rate_per_second: Number(rps) || 0,
         rate_per_minute: Number(rpm) || 0,
         context_window_k: Number(cw) || 0,
@@ -454,16 +637,21 @@ function ProfileSheet({
         priority: Number(priority) || 0,
         pool_exclude: poolExclude,
         streaming,
-        max_tokens: Math.max(0, Number(maxTokens) || 0),
-        // The field-name switch only matters for openai (Chat Completions); every other format falls back to the default,
-        // and the backend re-applies the same normalization; this just keeps the UI from sending contradictory values.
-        max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
-        session_header_key: sessionHeaderKey.trim(),
-        user_agent: userAgent.trim(),
+        max_tokens: outputCapSupported ? Math.max(0, Number(maxTokens) || 0) : 0,
+        max_tokens_field: !native && format === "openai" ? toStore(maxTokensField) : "",
+        session_header_key: native ? "" : sessionHeaderKey.trim(),
+        user_agent: native ? "" : userAgent.trim(),
+        price_input_per_m: native ? 0 : profile?.price_input_per_m,
+        price_output_per_m: native ? 0 : profile?.price_output_per_m,
+        price_cache_read_per_m: native ? 0 : profile?.price_cache_read_per_m,
+        price_cache_write_per_m: native ? 0 : profile?.price_cache_write_per_m,
         retry,
       });
       if (isNew) toast.success(`Created: ${name.trim()} (use "Set as active" on its card to enable it)`);
-      else toast.success(profile?.is_default ? "Saved; the active profile takes effect immediately, no restart needed" : "Saved");
+      else
+        toast.success(
+          profile?.is_default ? "Saved; the active profile takes effect immediately, no restart needed" : "Saved",
+        );
       onSaved(String(id));
       onOpenChange(false);
     } catch (e) {
@@ -484,7 +672,7 @@ function ProfileSheet({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
         side="right"
-        className="flex flex-col gap-0 p-0 data-[side=right]:min-w-[420px] data-[side=right]:sm:max-w-xl"
+        className="flex w-full flex-col gap-0 p-0 data-[side=right]:sm:min-w-[420px] data-[side=right]:sm:max-w-xl"
       >
         <SheetHeader className="px-4">
           <SheetTitle className="flex items-center gap-2">
@@ -503,6 +691,56 @@ function ProfileSheet({
         </SheetHeader>
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
+          <div className="grid gap-4 rounded-lg border p-3 sm:grid-cols-2">
+            <div className="grid gap-2">
+              <Label htmlFor="p-auth-mode">Authentication</Label>
+              <Select value={authMode} onValueChange={(value) => changeAuthMode(value as LLMAuthMode)}>
+                <SelectTrigger id="p-auth-mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="api_key">API key / local server</SelectItem>
+                  <SelectItem value="oauth">Experimental native account</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-muted-foreground text-xs">
+                {authMode === "oauth"
+                  ? "Uses a backend-stored browser session. Tokens are never entered or exposed here."
+                  : "Preserves the existing API-key and keyless Ollama workflow."}
+              </p>
+            </div>
+            {authMode === "oauth" && (
+              <div className="grid gap-2">
+                <Label htmlFor="p-credential">Account</Label>
+                <Select value={credentialID} onValueChange={selectCredential}>
+                  <SelectTrigger id="p-credential">
+                    <SelectValue placeholder="Select a connected account" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {credentials.map((credential) => (
+                      <SelectItem key={credential.id} value={String(credential.id)}>
+                        {credential.provider === "anthropic-oauth" ? "Claude" : "ChatGPT Codex"} · {credential.label} ·{" "}
+                        {credential.status === "ready" ? "session stored" : credential.status.replaceAll("_", " ")}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {credentialsError ? (
+                  <p className="text-destructive text-xs">{credentialsError}</p>
+                ) : credentials.length === 0 ? (
+                  <p className="text-muted-foreground text-xs">
+                    Connect an account in the Accounts tab before creating a native profile.
+                  </p>
+                ) : (
+                  <p className="text-muted-foreground text-xs">
+                    Selection is explicit. A disconnected account remains selected so it can be reauthenticated in
+                    place.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="grid gap-2">
               <Label htmlFor="p-name">Name</Label>
@@ -514,9 +752,13 @@ function ProfileSheet({
               />
             </div>
             <div className="grid gap-2">
-              <Label>Format</Label>
-              <Select value={format} onValueChange={(v) => setFormat(v as ProfileFormat)}>
-                <SelectTrigger>
+              <Label htmlFor="p-format">Format</Label>
+              <Select
+                value={format}
+                onValueChange={(v) => setFormat(v as ProfileFormat)}
+                disabled={authMode === "oauth"}
+              >
+                <SelectTrigger id="p-format">
                   <SelectValue placeholder="Select a format" />
                 </SelectTrigger>
                 <SelectContent>
@@ -526,6 +768,9 @@ function ProfileSheet({
                   <SelectItem value="ollama">Ollama (local, no key needed)</SelectItem>
                 </SelectContent>
               </Select>
+              {authMode === "oauth" && (
+                <p className="text-muted-foreground text-xs">Fixed by the selected account provider.</p>
+              )}
             </div>
           </div>
 
@@ -550,42 +795,102 @@ function ProfileSheet({
                     className="shrink-0"
                     disabled={loadingModels}
                     onClick={loadModels}
-                    title="Load available models from the API"
+                    title={authMode === "oauth" ? "Load pinned model catalog" : "Load available models from the API"}
+                    aria-label={authMode === "oauth" ? "Load pinned model catalog" : "Load available models"}
                   >
                     {loadingModels ? <Loader2Icon className="animate-spin" /> : <RefreshCwIcon />}
                   </Button>
                 </PopoverTrigger>
                 {models.length > 0 && (
                   <PopoverContent className="max-h-72 w-72 gap-0 overflow-y-auto overscroll-contain p-1" align="end">
-                    {models.map((m) => (
-                      <button
-                        key={m}
-                        type="button"
-                        className="w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs hover:bg-accent hover:text-accent-foreground"
-                        onClick={() => {
-                          setModel(m);
-                          setModelsOpen(false);
-                        }}
-                      >
-                        {m}
-                      </button>
-                    ))}
+                    {models.map((entry) => {
+                      const id = typeof entry === "string" ? entry : entry.id;
+                      const label = typeof entry === "string" ? entry : entry.name;
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          className="w-full shrink-0 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+                          onClick={() => {
+                            setModel(id);
+                            setModelsOpen(false);
+                            if (typeof entry !== "string") {
+                              setCw(String(entry.context_window_k));
+                              if (!entry.supports_thinking_disable && thinkingType === "disabled")
+                                setThinkingType(NONE);
+                              if (!entry.supports_output_cap) {
+                                setMaxTokens("0");
+                                setMaxTokensField(NONE);
+                              }
+                              if (
+                                entry.reasoning_efforts?.length &&
+                                effort !== NONE &&
+                                !entry.reasoning_efforts.includes(effort)
+                              ) {
+                                setEffort(NONE);
+                              }
+                            }
+                          }}
+                        >
+                          <span className="block font-medium">{label}</span>
+                          {typeof entry !== "string" && (
+                            <code className="block truncate text-muted-foreground">{id}</code>
+                          )}
+                        </button>
+                      );
+                    })}
                   </PopoverContent>
                 )}
               </Popover>
             </div>
+            {authMode === "oauth" && (
+              <p className="text-muted-foreground text-xs">
+                The pinned catalog describes protocol capabilities only. It does not confirm this account&apos;s model
+                entitlement, quota, balance, or billing.
+              </p>
+            )}
+            {selectedCatalog && (
+              <div className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground text-xs">
+                <span>{selectedCatalog.context_window_k}K context</span>
+                <span>Up to {selectedCatalog.max_output_tokens.toLocaleString()} output tokens</span>
+                <span>{selectedCatalog.supports_tools ? "Tools supported" : "No tool support"}</span>
+                <span>
+                  {selectedCatalog.supports_output_cap ? "Output cap supported" : "Operator output cap unsupported"}
+                </span>
+              </div>
+            )}
           </div>
 
-          <div className="grid gap-2">
-            <Label htmlFor="p-base-url">Base URL (optional)</Label>
-            <Input
-              id="p-base-url"
-              className="font-mono"
-              placeholder={format === "ollama" ? OLLAMA_DEFAULT_BASE_URL : "https://api.openai.com/v1"}
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-            />
-          </div>
+          {authMode === "oauth" ? (
+            <div className="grid gap-3 rounded-lg border p-3">
+              <div className="grid gap-1">
+                <Label className="text-sm">Managed endpoint</Label>
+                <code className="break-all text-muted-foreground text-xs">
+                  {managedNative?.endpoint ?? "Select an account to view its fixed endpoint"}
+                </code>
+              </div>
+              <div className="grid gap-1 border-t pt-3">
+                <Label className="text-sm">Managed User-Agent</Label>
+                <code className="break-all text-muted-foreground text-xs">
+                  {managedNative?.userAgent ?? "Select an account"}
+                </code>
+              </div>
+              <p className="text-muted-foreground text-xs">
+                These values are fixed by the native transport and cannot be redirected or overridden by this profile.
+              </p>
+            </div>
+          ) : (
+            <div className="grid gap-2">
+              <Label htmlFor="p-base-url">Base URL (optional)</Label>
+              <Input
+                id="p-base-url"
+                className="font-mono"
+                placeholder={format === "ollama" ? OLLAMA_DEFAULT_BASE_URL : "https://api.openai.com/v1"}
+                value={baseUrl}
+                onChange={(e) => setBaseUrl(e.target.value)}
+              />
+            </div>
+          )}
 
           <div className="grid gap-2">
             <Label htmlFor="p-proxy">Proxy (optional)</Label>
@@ -597,54 +902,58 @@ function ProfileSheet({
               onChange={(e) => setProxy(e.target.value)}
             />
             <p className="text-muted-foreground text-xs">
-              Only outbound LLM requests go through this proxy; http/https/socks5 are supported, optionally with credentials (e.g.
-              socks5://user:pass@host:port — URL-encode the password if it contains special characters). Leave empty for no proxy (direct connection).
+              Only outbound LLM requests go through this proxy; http/https/socks5 are supported, optionally with
+              credentials (e.g. socks5://user:pass@host:port — URL-encode the password if it contains special
+              characters). Leave empty for no proxy (direct connection).
             </p>
           </div>
 
-          <div className="grid gap-2">
-            <Label htmlFor="p-session-header">Custom session header (optional)</Label>
-            <Input
-              id="p-session-header"
-              className="font-mono"
-              placeholder="e.g. x-session-id (empty = not sent)"
-              value={sessionHeaderKey}
-              onChange={(e) => setSessionHeaderKey(e.target.value)}
-            />
-            <p className="text-muted-foreground text-xs">
-              Once a header name is set, every request carries this HTTP header, with the value filled in automatically as the <b>current session's session id</b> (chat sessions like
-              conv-12, workers like exp3-worker-i87). Meant for gateways that do prompt caching /
-              sticky routing on a session-id header; stable across turns of one session, distinct across sessions. Leave empty to not send it.
-            </p>
-          </div>
+          {authMode === "api_key" && (
+            <>
+              <div className="grid gap-2">
+                <Label htmlFor="p-session-header">Custom session header (optional)</Label>
+                <Input
+                  id="p-session-header"
+                  className="font-mono"
+                  placeholder="e.g. x-session-id (empty = not sent)"
+                  value={sessionHeaderKey}
+                  onChange={(e) => setSessionHeaderKey(e.target.value)}
+                />
+                <p className="text-muted-foreground text-xs">
+                  Once a header name is set, every request carries this HTTP header, with the value filled in
+                  automatically as the <b>current session's session id</b> (chat sessions like conv-12, workers like
+                  exp3-worker-i87). Meant for gateways that do prompt caching / sticky routing on a session-id header;
+                  stable across turns of one session, distinct across sessions. Leave empty to not send it.
+                </p>
+              </div>
 
-          <div className="grid gap-2">
-            <Label htmlFor="p-user-agent">Custom User-Agent (optional)</Label>
-            <Input
-              id="p-user-agent"
-              className="font-mono"
-              placeholder="e.g. my-app/1.0 (empty = default UA)"
-              value={userAgent}
-              onChange={(e) => setUserAgent(e.target.value)}
-            />
-            <p className="text-muted-foreground text-xs">
-              Overrides the <b>User-Agent</b> header on every outbound LLM request. Useful for gateways that route or allow-list by
-              User-Agent. Leave empty to keep the default User-Agent unchanged.
-            </p>
-          </div>
+              <div className="grid gap-2">
+                <Label htmlFor="p-user-agent">Custom User-Agent (optional)</Label>
+                <Input
+                  id="p-user-agent"
+                  className="font-mono"
+                  placeholder="e.g. my-app/1.0 (empty = default UA)"
+                  value={userAgent}
+                  onChange={(e) => setUserAgent(e.target.value)}
+                />
+                <p className="text-muted-foreground text-xs">
+                  Overrides the <b>User-Agent</b> header on every outbound LLM request. Useful for gateways that route
+                  or allow-list by User-Agent. Leave empty to keep the default User-Agent unchanged.
+                </p>
+              </div>
 
-          <div className="grid gap-2">
-            <Label htmlFor="p-api-key">
-              {format === "ollama" ? "API Key (optional for Ollama)" : "API Key"}
-            </Label>
-            <Input
-              id="p-api-key"
-              type="password"
-              placeholder={keyPlaceholder}
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-            />
-          </div>
+              <div className="grid gap-2">
+                <Label htmlFor="p-api-key">{format === "ollama" ? "API Key (optional for Ollama)" : "API Key"}</Label>
+                <Input
+                  id="p-api-key"
+                  type="password"
+                  placeholder={keyPlaceholder}
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                />
+              </div>
+            </>
+          )}
 
           <div className="grid gap-4 sm:grid-cols-3">
             <div className="grid gap-2">
@@ -656,12 +965,15 @@ function ProfileSheet({
               <Input id="p-rpm" type="number" min={0} value={rpm} onChange={(e) => setRpm(e.target.value)} />
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="p-cw">Context window (K)</Label>
+              <Label htmlFor="p-cw">
+                {authMode === "oauth" ? "Context window (K) · catalog" : "Context window (K)"}
+              </Label>
               <Input
                 id="p-cw"
                 type="number"
                 min={0}
                 max={1000}
+                disabled={authMode === "oauth"}
                 value={cw}
                 onChange={(e) => setCw(e.target.value)}
                 placeholder="200"
@@ -669,8 +981,9 @@ function ProfileSheet({
             </div>
           </div>
           <p className="-mt-2 text-muted-foreground text-xs">
-            Rate limits of 0 mean unlimited, shared across all agents. The context window is in K (thousand tokens); 0 = the 200K default, capped at 1000 (i.e.
-            1M). Setting it too high keeps compression from ever triggering.
+            {authMode === "oauth"
+              ? "Rate limits of 0 mean unlimited within ARTEX. The context window is pinned by the selected catalog model and is not an account quota result."
+              : "Rate limits of 0 mean unlimited, shared across all agents. The context window is in K (thousand tokens); 0 = the 200K default, capped at 1000 (1M). Setting it too high keeps compression from triggering."}
           </p>
 
           <div className="grid gap-3 rounded-lg border p-3">
@@ -680,7 +993,8 @@ function ProfileSheet({
                   Pool priority
                 </Label>
                 <p className="text-muted-foreground text-xs">
-                  Higher numbers are picked first; the active profile is always first regardless of this value. Profiles with equal priority take turns leading, spreading quota naturally.
+                  Higher numbers are picked first; the active profile is always first regardless of this value. Profiles
+                  with equal priority take turns leading, spreading quota naturally.
                 </p>
               </div>
               <Input
@@ -695,8 +1009,9 @@ function ProfileSheet({
               <div className="grid gap-0.5">
                 <Label className="text-sm">Excluded from pool</Label>
                 <p className="text-muted-foreground text-xs">
-                  When enabled, this profile is never used as a failover target (Agents / tasks can still pin it explicitly). Suited to expensive profiles reserved for one specific Agent
-                  that should not be burned through by other agents' failures.
+                  When enabled, this profile is never used as a failover target (Agents / tasks can still pin it
+                  explicitly). Suited to expensive profiles reserved for one specific Agent that should not be burned
+                  through by other agents' failures.
                 </p>
               </div>
               <Switch checked={poolExclude} onCheckedChange={setPoolExclude} aria-label="Excluded from pool" />
@@ -705,9 +1020,9 @@ function ProfileSheet({
               <div className="grid gap-0.5">
                 <Label className="text-sm">Streaming output</Label>
                 <p className="text-muted-foreground text-xs">
-                  On (default) streams over SSE, with live in-flight progress and real-time token counting. Off uses true non-streaming (stream:false,
-                  returning the full response in one shot) — a way around gateways with broken SSE implementations (empty frames / dropped thinking-field frames),
-                  at the cost of losing live in-flight progress.
+                  {selectedNativeProvider === "openai-codex-oauth"
+                    ? "On streams live progress from Codex. Off buffers the final message for the caller, but the upstream Codex request still uses stream:true and ARTEX collects its SSE before returning. Native failures remain terminal and are not replayed."
+                    : "On (default) streams over SSE, with live in-flight progress and real-time token counting. Off uses true non-streaming (stream:false, returning the full response in one shot) — a way around gateways with broken SSE implementations (empty frames / dropped thinking-field frames), at the cost of losing live in-flight progress."}
                 </p>
               </div>
               <Switch checked={streaming} onCheckedChange={setStreaming} aria-label="Streaming output" />
@@ -715,38 +1030,45 @@ function ProfileSheet({
           </div>
 
           <div className="grid gap-3 rounded-lg border p-3">
-            <div className="flex items-center justify-between gap-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="grid gap-0.5">
                 <Label htmlFor="p-max-tokens" className="text-sm">
                   Output cap · max tokens
                 </Label>
                 <p className="text-muted-foreground text-xs">
-                  How many tokens a single reply may generate at most; sent with every request. 0 (default) = the field is not sent, leaving it to the server default.
-                  This is not the same thing as the "context window" above: that is the model's total capacity, used only locally to compute the compression threshold.
-                  Set it too low and a reasoning model gets truncated mid-thinking, unable to emit even a one-word answer.
+                  {authMode === "oauth" && !outputCapSupported
+                    ? selectedNativeProvider === "openai-codex-oauth"
+                      ? "The Codex native transport does not support an operator output cap. Internal auxiliary budgets are advisory and are not a wire-level cap."
+                      : "Load and select a pinned catalog model to confirm whether its native transport supports an output cap."
+                    : "How many tokens one reply may generate at most. 0 leaves the field unsent and uses the provider default; the context window is a separate local compression setting."}
                 </p>
               </div>
               <Input
                 id="p-max-tokens"
                 type="number"
                 min={0}
-                className="w-28 shrink-0"
-                value={maxTokens}
+                className="w-full sm:w-28 sm:shrink-0"
+                value={outputCapSupported ? maxTokens : "0"}
+                disabled={!outputCapSupported}
                 onChange={(e) => setMaxTokens(e.target.value)}
                 placeholder="0"
               />
             </div>
-            <div className="flex items-center justify-between gap-4 border-t pt-3">
+            <div className="flex flex-col gap-3 border-t pt-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="grid gap-0.5">
                 <Label className="text-sm">Cap field name</Label>
-                <p className="text-muted-foreground text-xs">{MAX_TOKENS_FIELD_HINTS[format]}</p>
+                <p className="text-muted-foreground text-xs">
+                  {authMode === "oauth"
+                    ? "The native transport uses its fixed protocol field when the selected model supports this control."
+                    : MAX_TOKENS_FIELD_HINTS[format]}
+                </p>
               </div>
               <Select
-                value={format === "openai" ? maxTokensField : NONE}
+                value={authMode === "api_key" && format === "openai" ? maxTokensField : NONE}
                 onValueChange={setMaxTokensField}
-                disabled={format !== "openai"}
+                disabled={authMode === "oauth" || format !== "openai"}
               >
-                <SelectTrigger className="w-56 shrink-0">
+                <SelectTrigger className="w-full sm:w-56 sm:shrink-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -761,20 +1083,23 @@ function ProfileSheet({
           </div>
 
           <div className="grid gap-3 rounded-lg border p-3">
-            <div className="flex items-center justify-between gap-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="grid gap-0.5">
                 <Label className="text-sm">Thinking switch · thinking.type</Label>
                 <p className="text-muted-foreground text-xs">
-                  Controls whether the thinking field is sent. Not sent = the field is omitted (compatible with models like MiniMax that lack support); Disabled = send
-                  disabled; Enabled = send enabled. Independent of the effort below.
+                  {!supportsThinkingDisable
+                    ? selectedCatalog || selectedNativeProvider === "openai-codex-oauth"
+                      ? "This native model does not expose true reasoning-off. “Not sent” keeps the provider default; choosing a lower effort only minimizes reasoning and is not equivalent to off."
+                      : "Load and select a pinned catalog model before choosing a thinking-disable control."
+                    : "Controls whether the thinking field is omitted, disabled, or enabled. It remains independent from the effort setting below."}
                 </p>
               </div>
               <Select value={thinkingType} onValueChange={setThinkingType}>
-                <SelectTrigger className="w-32 shrink-0">
+                <SelectTrigger className="w-full sm:w-40 sm:shrink-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {THINKING_TYPES.map((o) => (
+                  {thinkingOptions.map((o) => (
                     <SelectItem key={o.value} value={o.value}>
                       {o.label}
                     </SelectItem>
@@ -782,20 +1107,20 @@ function ProfileSheet({
                 </SelectContent>
               </Select>
             </div>
-            <div className="flex items-center justify-between gap-4 border-t pt-3">
+            <div className="flex flex-col gap-3 border-t pt-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="grid gap-0.5">
                 <Label className="text-sm">Thinking effort · reasoning_effort</Label>
                 <p className="text-muted-foreground text-xs">
-                  A separate effort knob (OpenAI reasoning_effort / Anthropic output_config.effort). Some APIs have no thinking
-                  field and activate thinking via effort alone, so it can be set on its own without sending the thinking switch.
+                  A separate effort control. The pinned native catalog limits this list to protocol-supported values;
+                  availability is still checked by the provider.
                 </p>
               </div>
               <Select value={effort} onValueChange={setEffort}>
-                <SelectTrigger className="w-32 shrink-0">
+                <SelectTrigger className="w-full sm:w-40 sm:shrink-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {EFFORT_LEVELS.map((o) => (
+                  {effortOptions.map((o) => (
                     <SelectItem key={o.value} value={o.value}>
                       {o.label}
                     </SelectItem>
@@ -805,7 +1130,14 @@ function ProfileSheet({
             </div>
           </div>
 
-          <ProfileRetryFields value={retry} onChange={setRetry} />
+          {authMode === "api_key" ? (
+            <ProfileRetryFields value={retry} onChange={setRetry} />
+          ) : (
+            <div className="rounded-lg border border-dashed p-3 text-muted-foreground text-xs">
+              Native account failures are terminal: ARTEX does not replay the physical request, rotate accounts, or fall
+              back to an API key.
+            </div>
+          )}
         </div>
 
         <div className="flex gap-2 border-t px-4 py-3">
@@ -828,6 +1160,11 @@ function ProfileSheet({
 
 export default function LLMPage() {
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
+  const [profilesLoading, setProfilesLoading] = React.useState(true);
+  const [profilesError, setProfilesError] = React.useState("");
+  const [credentials, setCredentials] = React.useState<LLMCredential[]>([]);
+  const [credentialsLoading, setCredentialsLoading] = React.useState(true);
+  const [credentialsError, setCredentialsError] = React.useState("");
   const [pool, setPool] = React.useState<LLMPoolStatus | null>(null);
   const [poolOpen, setPoolOpen] = React.useState(false);
   // The drawer's open flag and its content are stored separately: editing stays put on close, otherwise during the closing animation the title would flash
@@ -843,18 +1180,37 @@ export default function LLMPage() {
     try {
       setPool(await api.llmPool());
     } catch {
-      /* ignore */
+      /* Pool state is supplementary; profile and account errors are surfaced independently. */
+    }
+  }, []);
+
+  const loadProfiles = React.useCallback(async () => {
+    setProfilesLoading(true);
+    setProfilesError("");
+    try {
+      setProfiles(await api.llmProfiles());
+    } catch (cause) {
+      setProfilesError((cause as Error).message);
+    } finally {
+      setProfilesLoading(false);
+    }
+  }, []);
+
+  const loadCredentials = React.useCallback(async () => {
+    setCredentialsLoading(true);
+    setCredentialsError("");
+    try {
+      setCredentials(await api.llmCredentials());
+    } catch (cause) {
+      setCredentialsError((cause as Error).message);
+    } finally {
+      setCredentialsLoading(false);
     }
   }, []);
 
   const load = React.useCallback(async () => {
-    try {
-      setProfiles(await api.llmProfiles());
-    } catch {
-      /* ignore */
-    }
-    await loadPool();
-  }, [loadPool]);
+    await Promise.all([loadProfiles(), loadPool(), loadCredentials()]);
+  }, [loadCredentials, loadPool, loadProfiles]);
 
   React.useEffect(() => {
     void load();
@@ -866,6 +1222,11 @@ export default function LLMPage() {
     for (const c of pool?.chain ?? []) m.set(c.profile_id, c);
     return m;
   }, [pool]);
+  const credentialsByID = React.useMemo(() => {
+    const result = new Map<number, LLMCredential>();
+    for (const credential of credentials) result.set(credential.id, credential);
+    return result;
+  }, [credentials]);
 
   async function activate(id: string, name: string) {
     try {
@@ -898,11 +1259,12 @@ export default function LLMPage() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="font-semibold text-xl tracking-tight">LLM</h1>
-          <p className="text-muted-foreground text-sm">
-            Format / model / rate-limit settings shared by all agents. Click a card to edit it; the starred card is the active profile.
+          <p className="max-w-3xl text-muted-foreground text-sm">
+            Model profiles, connected accounts, and rate limits shared by all agents. Click a profile to edit it; new
+            profiles require explicit activation.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button size="sm" variant="outline" onClick={() => setPoolOpen(true)}>
             <ZapIcon /> Pool settings
             {poolOn && (
@@ -918,15 +1280,39 @@ export default function LLMPage() {
       </div>
 
       <Tabs defaultValue="profiles" className="flex-1">
-        <TabsList>
+        <TabsList className="max-w-full overflow-x-auto">
           <TabsTrigger value="profiles">Model profiles</TabsTrigger>
+          <TabsTrigger value="accounts">Accounts</TabsTrigger>
           <TabsTrigger value="retry">Retry & backoff</TabsTrigger>
         </TabsList>
 
         <TabsContent value="profiles" className="mt-4">
+          {profilesError && (
+            <Alert variant="destructive" className="mb-4">
+              <AlertCircleIcon />
+              <AlertTitle>Model profiles unavailable</AlertTitle>
+              <AlertDescription className="grid gap-2">
+                <span>{profilesError}</span>
+                <Button type="button" size="sm" variant="outline" className="w-fit" onClick={() => void loadProfiles()}>
+                  Retry profiles
+                </Button>
+              </AlertDescription>
+            </Alert>
+          )}
+          {credentialsError && (
+            <Alert className="mb-4">
+              <AlertCircleIcon />
+              <AlertTitle>Connected account status unavailable</AlertTitle>
+              <AlertDescription>
+                {credentialsError} API-key and Ollama profiles remain available; native account state cannot be
+                confirmed until the account API recovers.
+              </AlertDescription>
+            </Alert>
+          )}
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
             {profiles.map((p) => {
-              const h = healthOf(p, health.get(p.id));
+              const credential = p.credential_id ? credentialsByID.get(p.credential_id) : undefined;
+              const h = healthOf(p, health.get(p.id), credential);
               return (
                 // biome-ignore lint/a11y/useSemanticElements: the card contains its own action buttons; a native <button> would nest buttons (invalid HTML)
                 <Card
@@ -941,7 +1327,7 @@ export default function LLMPage() {
                     }
                   }}
                   className={cn(
-                    "cursor-pointer gap-0 py-4 outline-none transition-colors hover:border-foreground/30",
+                    "cursor-pointer gap-0 py-4 outline-none transition-colors hover:border-foreground/30 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
                     p.is_default && "border-amber-400/50 bg-amber-400/5",
                   )}
                 >
@@ -968,15 +1354,20 @@ export default function LLMPage() {
                     </div>
 
                     <div className="flex flex-wrap gap-x-3 gap-y-0.5 pl-6 text-muted-foreground text-xs">
-                      {p.api_key_hint && <span>{p.api_key_hint}</span>}
+                      {(p.auth_mode ?? "api_key") === "oauth" ? (
+                        <>
+                          <span>Native account</span>
+                          {credential && <span>{credential.label}</span>}
+                          {p.auth_binding_generation !== undefined && <span>Binding {p.auth_binding_generation}</span>}
+                        </>
+                      ) : (
+                        p.api_key_hint && <span>{p.api_key_hint}</span>
+                      )}
                       <span>
                         {p.rate_per_second}/s · {p.rate_per_minute}/min
                       </span>
                       {p.proxy && <span className="truncate">Proxy {p.proxy}</span>}
-                      {p.reasoning_effort && (
-                        <span>Thinking {p.reasoning_effort === "off" ? "off" : p.reasoning_effort}</span>
-                      )}
-                      {/* The two pool-related fields only matter when the pool is on; when it is off they take no space */}
+                      {p.reasoning_effort && <span>Thinking effort {p.reasoning_effort}</span>}
                       {poolOn &&
                         !p.is_default &&
                         (p.pool_exclude ? <span>Excluded from pool</span> : <span>Priority {p.priority ?? 0}</span>)}
@@ -1011,12 +1402,26 @@ export default function LLMPage() {
                 </Card>
               );
             })}
-            {profiles.length === 0 && (
+            {profilesLoading && profiles.length === 0 && (
+              <div className="col-span-full flex items-center justify-center gap-2 rounded-lg border border-dashed p-10 text-muted-foreground text-sm">
+                <Loader2Icon className="size-4 animate-spin" /> Loading model profiles…
+              </div>
+            )}
+            {!profilesLoading && !profilesError && profiles.length === 0 && (
               <div className="col-span-full rounded-lg border border-dashed p-10 text-center text-muted-foreground text-sm">
-                No model profiles yet — click "Create" in the top right to add the first one.
+                No model profiles yet — click “Create” in the top right to add the first one.
               </div>
             )}
           </div>
+        </TabsContent>
+
+        <TabsContent value="accounts" className="mt-4">
+          <AccountsPanel
+            credentials={credentials}
+            loading={credentialsLoading}
+            error={credentialsError}
+            onRefresh={loadCredentials}
+          />
         </TabsContent>
 
         <TabsContent value="retry" className="mt-4">
@@ -1024,7 +1429,14 @@ export default function LLMPage() {
         </TabsContent>
       </Tabs>
 
-      <ProfileSheet profile={editing} open={editOpen} onOpenChange={setEditOpen} onSaved={() => void load()} />
+      <ProfileSheet
+        profile={editing}
+        credentials={credentials}
+        credentialsError={credentialsError}
+        open={editOpen}
+        onOpenChange={setEditOpen}
+        onSaved={() => void load()}
+      />
       <PoolSheet open={poolOpen} onOpenChange={setPoolOpen} pool={pool} onReload={loadPool} />
     </div>
   );

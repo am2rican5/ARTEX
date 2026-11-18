@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 // spend records n tokens as one task-level call; finishWorker records one

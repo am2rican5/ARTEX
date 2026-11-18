@@ -16,8 +16,8 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/norma/llm"
-	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 // Step 1.9: the WebFetch tool of every agent kind checks each redirect hop

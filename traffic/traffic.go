@@ -31,9 +31,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/internal/norma/permission"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 	"github.com/Autumn-27/artex/traffic/rewrite"
-	"github.com/Autumn-27/norma/permission"
-	actool "github.com/Autumn-27/norma/tool"
 	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
 	_ "modernc.org/sqlite"
 )

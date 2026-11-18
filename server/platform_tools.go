@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
-	actool "github.com/Autumn-27/norma/tool"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 // Platform operation tools (for the built-in Auto agent): create/edit skills,

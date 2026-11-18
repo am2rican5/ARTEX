@@ -8,7 +8,7 @@ import (
 
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/intercept"
-	actool "github.com/Autumn-27/norma/tool"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 // pinNoiseOff runs t with the off noise profile, whatever ARTEX_NOISE_PROFILE says.

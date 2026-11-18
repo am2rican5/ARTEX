@@ -13,16 +13,19 @@ import (
 // ---------- LLM profiles ----------
 
 type LLMProfile struct {
-	ID            int64   `json:"id"`
-	Name          string  `json:"name"`
-	Format        string  `json:"format"`
-	BaseURL       string  `json:"base_url,omitempty"`
-	Proxy         string  `json:"proxy,omitempty"` // LLM outbound proxy (http/https/socks5); empty = use environment variables
-	Model         string  `json:"model"`
-	APIKey        string  `json:"-"` // never serialized to UI
-	APIKeyHint    string  `json:"api_key_hint,omitempty"`
-	RatePerSecond float64 `json:"rate_per_second"`
-	RatePerMinute float64 `json:"rate_per_minute"`
+	ID                    int64   `json:"id"`
+	Name                  string  `json:"name"`
+	Format                string  `json:"format"`
+	BaseURL               string  `json:"base_url,omitempty"`
+	Proxy                 string  `json:"proxy,omitempty"` // LLM outbound proxy (http/https/socks5); empty = use environment variables
+	Model                 string  `json:"model"`
+	APIKey                string  `json:"-"` // never serialized to UI
+	APIKeyHint            string  `json:"api_key_hint,omitempty"`
+	AuthMode              string  `json:"auth_mode"`
+	CredentialID          *int64  `json:"credential_id"`
+	AuthBindingGeneration int64   `json:"auth_binding_generation"`
+	RatePerSecond         float64 `json:"rate_per_second"`
+	RatePerMinute         float64 `json:"rate_per_minute"`
 	// ContextWindowK is the model's context window in K tokens, used to size
 	// compaction thresholds. 0 = use a 200K default; capped at 1000 (1M).
 	ContextWindowK int `json:"context_window_k"`
@@ -93,8 +96,8 @@ type RetryOverride struct {
 // profileCols is the read column list (hint variant, no api key) shared by the
 // list query; profileColsKey is the same with api_key for the single-row loads.
 const profileRetryCols = `COALESCE(retry_connect_attempts,0),COALESCE(retry_connect_interval_ms,0),COALESCE(retry_empty_attempts,0),COALESCE(retry_empty_interval_ms,0),COALESCE(retry_stream_attempts,0),COALESCE(retry_stream_interval_ms,0)`
-const profileCols = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key_hint,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,COALESCE(price_input_per_m,0),COALESCE(price_output_per_m,0),COALESCE(price_cache_read_per_m,0),COALESCE(price_cache_write_per_m,0),COALESCE(user_agent,'')`
-const profileColsKey = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,COALESCE(price_input_per_m,0),COALESCE(price_output_per_m,0),COALESCE(price_cache_read_per_m,0),COALESCE(price_cache_write_per_m,0),COALESCE(user_agent,'')`
+const profileCols = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key_hint,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,COALESCE(price_input_per_m,0),COALESCE(price_output_per_m,0),COALESCE(price_cache_read_per_m,0),COALESCE(price_cache_write_per_m,0),COALESCE(user_agent,''),COALESCE(auth_mode,'api_key'),credential_id,COALESCE(auth_binding_generation,0)`
+const profileColsKey = `id,name,format,COALESCE(base_url,''),COALESCE(proxy,''),model,COALESCE(api_key,''),rate_per_second,rate_per_minute,context_window_k,COALESCE(reasoning_effort,''),is_default,priority,pool_exclude,COALESCE(thinking_type,''),COALESCE(streaming,true),COALESCE(max_tokens,0),COALESCE(max_tokens_field,''),COALESCE(session_header_key,''),` + profileRetryCols + `,COALESCE(price_input_per_m,0),COALESCE(price_output_per_m,0),COALESCE(price_cache_read_per_m,0),COALESCE(price_cache_write_per_m,0),COALESCE(user_agent,''),COALESCE(auth_mode,'api_key'),credential_id,COALESCE(auth_binding_generation,0)`
 
 // scanProfile reads one row in the profileCols / profileColsKey column order. The
 // 7th column lands in APIKeyHint or APIKey depending on which list the caller used.
@@ -106,7 +109,7 @@ func scanProfile(sc interface{ Scan(...any) error }, into *string, p *LLMProfile
 		&p.Retry.Empty.Attempts, &p.Retry.Empty.IntervalMS,
 		&p.Retry.Stream.Attempts, &p.Retry.Stream.IntervalMS,
 		&p.PriceInputPerM, &p.PriceOutputPerM, &p.PriceCacheReadPerM, &p.PriceCacheWritePerM,
-		&p.UserAgent)
+		&p.UserAgent, &p.AuthMode, &p.CredentialID, &p.AuthBindingGeneration)
 	if err != nil {
 		return err
 	}
@@ -155,15 +158,14 @@ func (d *DB) ProfileByID(id int64) (*LLMProfile, error) {
 	return &p, err
 }
 
-// PoolProfiles returns the failover chain in run order, api keys included: the
-// active profile first, then every other usable profile that isn't excluded, by
-// priority DESC (id ASC to stay stable). Profiles without an api key can't serve
-// a request — except Ollama ('ollama'), which is a keyless local server — so
-// they never enter the chain. The ordering IS the policy — callers walk the
-// slice front to back.
+// PoolProfiles returns the failover chain in run order, credentials included:
+// the active profile first, then every other usable profile that isn't excluded,
+// by priority DESC (id ASC to stay stable). API-key profiles need a key except
+// Ollama, while a selected OAuth profile stays in the chain for every credential
+// lifecycle status so reauthentication or revocation cannot become fallback.
 func (d *DB) PoolProfiles() ([]*LLMProfile, error) {
 	rows, err := d.Query(`SELECT ` + profileColsKey + ` FROM llm_profiles
-WHERE (COALESCE(api_key,'') <> '' OR format='ollama') AND (is_default OR NOT pool_exclude)
+WHERE (auth_mode='oauth' OR COALESCE(api_key,'') <> '' OR format='ollama') AND (is_default OR NOT pool_exclude)
 ORDER BY is_default DESC, priority DESC, id ASC`)
 	if err != nil {
 		return nil, err
@@ -180,12 +182,30 @@ ORDER BY is_default DESC, priority DESC, id ASC`)
 	return out, rows.Err()
 }
 
-// SaveProfile inserts (id==0) or updates a profile. Empty apiKey on update keeps existing.
+// SaveProfile inserts (id==0) or updates a profile. An empty API key on an
+// api_key update keeps the existing key. OAuth binding and API-key clearing are
+// written by the same statement, and the binding generation changes only when
+// auth mode or credential reference actually changes.
 func (d *DB) SaveProfile(p *LLMProfile) (int64, error) {
-	// Pasted keys can carry surrounding whitespace; every reader that goes
-	// through ConfigFrom trims, so store the trimmed form or the raw value
-	// leaks into paths that assign it directly (the llm/test fallback).
+	if p == nil {
+		return 0, errors.New("LLM profile is nil")
+	}
 	p.APIKey = strings.TrimSpace(p.APIKey)
+	if p.AuthMode == "" {
+		p.AuthMode = "api_key"
+	}
+	switch p.AuthMode {
+	case "api_key":
+		p.CredentialID = nil
+	case "oauth":
+		if p.CredentialID == nil {
+			return 0, errors.New("OAuth LLM profile requires a credential")
+		}
+		p.APIKey = ""
+		p.APIKeyHint = ""
+	default:
+		return 0, fmt.Errorf("unsupported LLM profile auth mode %q", p.AuthMode)
+	}
 	hint := p.APIKeyHint
 	if len(p.APIKey) >= 4 {
 		hint = "…" + p.APIKey[len(p.APIKey)-4:]
@@ -201,27 +221,30 @@ func (d *DB) SaveProfile(p *LLMProfile) (int64, error) {
 	r := p.Retry.Clamped()
 	if p.ID == 0 {
 		var id int64
-		err := d.QueryRow(`INSERT INTO llm_profiles(name,format,base_url,proxy,model,api_key,api_key_hint,rate_per_second,rate_per_minute,context_window_k,reasoning_effort,priority,pool_exclude,thinking_type,streaming,max_tokens,max_tokens_field,session_header_key,retry_connect_attempts,retry_connect_interval_ms,retry_empty_attempts,retry_empty_interval_ms,retry_stream_attempts,retry_stream_interval_ms,user_agent)
-VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) RETURNING id`,
-			p.Name, p.Format, p.BaseURL, proxy, p.Model, key, hint, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
-			r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS, p.UserAgent).Scan(&id)
+		err := d.QueryRow(`INSERT INTO llm_profiles(name,format,base_url,proxy,model,api_key,api_key_hint,auth_mode,credential_id,rate_per_second,rate_per_minute,context_window_k,reasoning_effort,priority,pool_exclude,thinking_type,streaming,max_tokens,max_tokens_field,session_header_key,retry_connect_attempts,retry_connect_interval_ms,retry_empty_attempts,retry_empty_interval_ms,retry_stream_attempts,retry_stream_interval_ms,user_agent)
+VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,NULLIF($6,''),NULLIF($7,''),$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+RETURNING id,auth_binding_generation`,
+			p.Name, p.Format, p.BaseURL, proxy, p.Model, key, hint, p.AuthMode, p.CredentialID, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
+			r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS, p.UserAgent).Scan(&id, &p.AuthBindingGeneration)
 		if err == nil {
 			_, err = d.saveProfilePrices(id, p)
 		}
 		return id, err
 	}
-	if p.APIKey == "" {
-		_, err := d.Exec(`UPDATE llm_profiles SET name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,rate_per_second=$6,rate_per_minute=$7,context_window_k=$8,reasoning_effort=$9,priority=$10,pool_exclude=$11,thinking_type=$12,streaming=$13,max_tokens=$14,max_tokens_field=$15,session_header_key=$16,retry_connect_attempts=$17,retry_connect_interval_ms=$18,retry_empty_attempts=$19,retry_empty_interval_ms=$20,retry_stream_attempts=$21,retry_stream_interval_ms=$22,user_agent=$23 WHERE id=$24`,
-			p.Name, p.Format, p.BaseURL, proxy, p.Model, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
-			r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS, p.UserAgent, p.ID)
-		if err == nil {
-			_, err = d.saveProfilePrices(p.ID, p)
-		}
-		return p.ID, err
+	err = d.QueryRow(`UPDATE llm_profiles SET
+name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,
+api_key=CASE WHEN $8='oauth' THEN NULL WHEN $6<>'' THEN $6 ELSE api_key END,
+api_key_hint=CASE WHEN $8='oauth' THEN NULL WHEN $6<>'' THEN NULLIF($7,'') ELSE api_key_hint END,
+auth_binding_generation=auth_binding_generation+CASE WHEN auth_mode IS DISTINCT FROM $8 OR credential_id IS DISTINCT FROM $9 THEN 1 ELSE 0 END,
+auth_mode=$8,credential_id=$9,
+rate_per_second=$10,rate_per_minute=$11,context_window_k=$12,reasoning_effort=$13,priority=$14,pool_exclude=$15,thinking_type=$16,streaming=$17,max_tokens=$18,max_tokens_field=$19,session_header_key=$20,
+retry_connect_attempts=$21,retry_connect_interval_ms=$22,retry_empty_attempts=$23,retry_empty_interval_ms=$24,retry_stream_attempts=$25,retry_stream_interval_ms=$26,user_agent=$27
+WHERE id=$28 RETURNING auth_binding_generation`,
+		p.Name, p.Format, p.BaseURL, proxy, p.Model, key, hint, p.AuthMode, p.CredentialID, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
+		r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS, p.UserAgent, p.ID).Scan(&p.AuthBindingGeneration)
+	if errors.Is(err, sql.ErrNoRows) {
+		return p.ID, ErrLLMProfileNotFound
 	}
-	_, err = d.Exec(`UPDATE llm_profiles SET name=$1,format=$2,base_url=NULLIF($3,''),proxy=NULLIF($4,''),model=$5,api_key=$6,api_key_hint=$7,rate_per_second=$8,rate_per_minute=$9,context_window_k=$10,reasoning_effort=$11,priority=$12,pool_exclude=$13,thinking_type=$14,streaming=$15,max_tokens=$16,max_tokens_field=$17,session_header_key=$18,retry_connect_attempts=$19,retry_connect_interval_ms=$20,retry_empty_attempts=$21,retry_empty_interval_ms=$22,retry_stream_attempts=$23,retry_stream_interval_ms=$24,user_agent=$25 WHERE id=$26`,
-		p.Name, p.Format, p.BaseURL, proxy, p.Model, key, hint, p.RatePerSecond, p.RatePerMinute, p.ContextWindowK, p.ReasoningEffort, p.Priority, p.PoolExclude, p.ThinkingType, p.Streaming, p.MaxTokens, p.MaxTokensField, p.SessionHeaderKey,
-		r.Connect.Attempts, r.Connect.IntervalMS, r.Empty.Attempts, r.Empty.IntervalMS, r.Stream.Attempts, r.Stream.IntervalMS, p.UserAgent, p.ID)
 	if err == nil {
 		_, err = d.saveProfilePrices(p.ID, p)
 	}

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"iter"
@@ -16,9 +18,10 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/internal/norma/harness"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 	"github.com/Autumn-27/artex/sidequestion"
-	"github.com/Autumn-27/norma/harness"
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/subscription"
 )
 
 type sideHTTPProvider struct {
@@ -55,6 +58,56 @@ func (p *sideHTTPProvider) Complete(ctx context.Context, req llm.CompletionReque
 		}
 	}
 	return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("atomic answer")}}, "end_turn", llm.Usage{InputTokens: 19}, nil
+}
+
+func TestSideModelNativeBindingIdentityAndLegacyStability(t *testing.T) {
+	legacy := agent.Config{
+		Format: llm.FormatOpenAI, BaseURL: "https://legacy.invalid/v1", Model: "legacy-model",
+		ThinkingType: "disabled", ReasoningEffort: "low", Stream: true,
+		MaxTokensField: "max_tokens", SessionHeaderKey: "x-session", UserAgent: "fixture",
+		AuthMode: "api_key", CredentialID: 91, AuthBindingGeneration: 12, APIKey: "legacy-secret",
+	}
+	oldFields, _ := json.Marshal([]any{legacy.Format, legacy.BaseURL, legacy.Model, legacy.ThinkingType, legacy.ReasoningEffort, legacy.Stream, legacy.MaxTokensField, legacy.SessionHeaderKey, legacy.UserAgent})
+	oldHash := sha256.Sum256(oldFields)
+	legacyModel := sideModel(legacy, 8, "legacy")
+	if legacyModel.Identity != hex.EncodeToString(oldHash[:]) {
+		t.Fatalf("legacy identity changed: %q", legacyModel.Identity)
+	}
+	if legacyModel.AuthMode != "" || legacyModel.CredentialID != 0 || legacyModel.AuthBindingGeneration != 0 {
+		t.Fatalf("legacy model exposed unused native identity: %+v", legacyModel)
+	}
+
+	native := legacy
+	native.AuthMode = "oauth"
+	native.CredentialID = 41
+	native.AuthBindingGeneration = 7
+	native.APIKey = "rotating-token-must-not-be-identity"
+	first := sideModel(native, 9, "native")
+	refreshed := native
+	refreshed.APIKey = "different-refresh-token-must-not-be-identity"
+	if got := sideModel(refreshed, 9, "native"); got.Identity != first.Identity {
+		t.Fatalf("ordinary token refresh changed side identity: %q != %q", got.Identity, first.Identity)
+	}
+	rebound := native
+	rebound.AuthBindingGeneration++
+	if sideModel(rebound, 9, "native").Identity == first.Identity {
+		t.Fatal("account binding generation change left side identity stable")
+	}
+	otherCredential := native
+	otherCredential.CredentialID++
+	if sideModel(otherCredential, 9, "native").Identity == first.Identity {
+		t.Fatal("credential change left side identity stable")
+	}
+	if first.AuthMode != "oauth" || first.CredentialID != 41 || first.AuthBindingGeneration != 7 {
+		t.Fatalf("native model omitted binding identity: %+v", first)
+	}
+	encoded, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "rotating-token") || !strings.Contains(string(encoded), `"credential_id":41`) || !strings.Contains(string(encoded), `"auth_binding_generation":7`) {
+		t.Fatalf("native model serialization has wrong identity fields: %s", encoded)
+	}
 }
 
 func TestSideHTTPPreparationCancellationAndClear(t *testing.T) {
@@ -441,6 +494,35 @@ func TestSideRejectsDeletedOrChangedCachedProfile(t *testing.T) {
 	}
 	if _, err = f.s.sideProvider(model); err == nil {
 		t.Fatal("deleted profile remained usable from cache")
+	}
+}
+
+func TestSideNativeBindingChangeIsTerminalWithoutGlobalFallback(t *testing.T) {
+	f := newSideHTTPFixture(t)
+	stamp := time.Now().UnixNano()
+	credential, err := f.m.pg.CreateLLMCredential(t.Context(), "openai-codex-oauth", fmt.Sprintf("side-native-%d", stamp), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = f.m.pg.Exec(`DELETE FROM llm_credentials WHERE id=$1`, credential.ID) })
+	profile := &db.LLMProfile{
+		Name: fmt.Sprintf("btw-native-profile-%d", stamp), Format: "openai-responses", Model: "codex-native",
+		AuthMode: "oauth", CredentialID: &credential.ID, Streaming: true,
+	}
+	id, err := f.m.pg.SaveProfile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.m.pg.DeleteProfile(id) })
+	cfg, ok := f.s.loadProfileConfig(id)
+	if !ok {
+		t.Fatal("native profile metadata was treated as an absent API-key profile")
+	}
+	oldBinding := cfg
+	oldBinding.AuthBindingGeneration--
+	got, err := f.s.sideProvider(sideModel(oldBinding, id, profile.Name))
+	if got != nil || err == nil || !subscription.IsTerminal(err) {
+		t.Fatalf("native binding change provider=%T error=%v, want nil provider and terminal no-fallback error", got, err)
 	}
 }
 

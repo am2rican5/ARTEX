@@ -6,8 +6,8 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 	"github.com/Autumn-27/artex/llmpool"
-	"github.com/Autumn-27/norma/llm"
 )
 
 // Server-side wiring for LLM pooling (failover). Design: docs/llm-polling-design.md:

@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 // TestConfigFromOpenAIResponses locks the openai-responses format wiring:
@@ -24,7 +24,7 @@ func TestConfigFromOpenAIResponses(t *testing.T) {
 	if !c.Stream { // default streaming preserved
 		t.Fatal("Stream should default true")
 	}
-	if _, err := c.NewProvider(); err != nil {
+	if _, err := c.NewProvider(nil); err != nil {
 		t.Fatalf("NewProvider: %v", err)
 	}
 }

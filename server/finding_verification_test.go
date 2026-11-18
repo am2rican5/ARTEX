@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
-	actool "github.com/Autumn-27/norma/tool"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 const verificationBody = "HTTP/1.1 200 OK\nuser   admin:\tx7\nend of dump"

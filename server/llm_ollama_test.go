@@ -12,7 +12,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 // ConfigFrom("ollama", ...) must normalize to the keyless sentinel with our own
@@ -72,7 +72,7 @@ func TestOllamaProviderWiresOpenAIProtocol(t *testing.T) {
 
 	cfg := agent.ConfigFrom("ollama", "llama3.2", fake.URL, "", "")
 	cfg.Stream = false // non-streaming: the fake answers one plain JSON body
-	prov, err := cfg.NewProvider()
+	prov, err := cfg.NewProvider(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

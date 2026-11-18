@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 // SideQuestionService has no harness, tool executor, transcript writer or model

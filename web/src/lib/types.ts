@@ -1108,10 +1108,61 @@ export interface NotificationDelivery {
 }
 
 // ---- LLM config ----
+export type LLMAuthMode = "api_key" | "oauth";
+
+export type LLMCredentialProvider = "anthropic-oauth" | "openai-codex-oauth";
+
+export type LLMCredentialStatus = "ready" | "reauth_required" | "revoked";
+
+export interface LLMCredential {
+  id: number;
+  provider: LLMCredentialProvider;
+  label: string;
+  status: LLMCredentialStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export type LLMCredentialAttemptStatus = "pending" | "complete" | "failed";
+
+export interface LLMCredentialAttempt {
+  id: string;
+  provider: LLMCredentialProvider;
+  status: LLMCredentialAttemptStatus;
+  authorization_url?: string;
+  callback_url?: string;
+  credential_id?: number;
+  expires_at: string;
+  error?: string;
+}
+
+export interface LLMCredentialDisconnect {
+  status: "revoked";
+  remote_revocation_confirmed: boolean;
+  warning?: string;
+}
+
+// A pinned native-provider catalog entry. It is not a live entitlement, quota,
+// balance, or billing result for the selected account.
+export interface LLMModelCatalogEntry {
+  id: string;
+  name: string;
+  provider: LLMCredentialProvider;
+  context_window_k: number;
+  max_output_tokens: number;
+  supports_tools: boolean;
+  supports_thinking_disable: boolean;
+  supports_output_cap: boolean;
+  reasoning_efforts?: string[];
+}
+
 export interface LLMProfile {
   id: string;
   name: string;
   format: "openai" | "anthropic" | "openai-responses" | "ollama";
+  auth_mode?: LLMAuthMode;
+  credential_id?: number | null;
+  auth_binding_generation?: number;
   base_url?: string;
   proxy?: string;
   model: string;
@@ -1407,7 +1458,6 @@ export type TaskCredential = TaskCredentialInput & {
   created_at: string;
   updated_at: string;
 };
-
 
 export interface AssetInterceptRule {
   id: number;

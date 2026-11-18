@@ -9,7 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	"github.com/Autumn-27/artex/subscription"
 )
 
 // fakeProv is a scripted provider: script[i] is what the i-th call yields —
@@ -366,5 +367,143 @@ func TestExpiredWindowIsClosed(t *testing.T) {
 	reg.Restore(1, State{Trips: 1, OpenUntil: time.Now().Add(-time.Second)})
 	if reg.IsOpen(1) {
 		t.Fatal("expired window should read as closed")
+	}
+}
+
+type terminalPoolProvider struct {
+	err   error
+	usage llm.Usage
+	calls int
+}
+
+func (p *terminalPoolProvider) Stream(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return func(yield func(llm.StreamEvent, error) bool) {
+		p.calls++
+		yield(llm.StreamEvent{}, p.err)
+	}
+}
+
+func (p *terminalPoolProvider) Complete(context.Context, llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	p.calls++
+	return llm.Message{}, "", p.usage, p.err
+}
+
+func TestNativeTerminalErrorsDoNotChangePoolAccount(t *testing.T) {
+	cases := []struct {
+		name    string
+		message string
+		status  int
+	}{
+		{name: "unauthorized", message: "upstream status 401", status: 401},
+		{name: "rate_limit", message: "upstream status 429", status: 429},
+		{name: "no_status", message: "connection reset before response"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/complete", func(t *testing.T) {
+			nativeErr := &subscription.Error{
+				Code:    subscription.CodeAuthRequired,
+				Message: tc.message,
+				Status:  tc.status,
+			}
+			wantUsage := llm.Usage{InputTokens: 13, OutputTokens: 5}
+			first := &terminalPoolProvider{err: nativeErr, usage: wantUsage}
+			next := okProv("api-fallback", "must not run")
+			registry := NewRegistry(nil, nil)
+			registry.Trip(1, "pre-existing failure", false)
+			pool := New([]*Member{
+				member(1, "native-account", RankActive, first),
+				member(2, "api-fallback", 1, next),
+			}, registry)
+
+			_, _, usage, err := pool.Complete(context.Background(), llm.CompletionRequest{})
+			var gotNative *subscription.Error
+			if !errors.As(err, &gotNative) {
+				t.Fatalf("error = %T %v, want wrapped native terminal error", err, err)
+			}
+			if usage != wantUsage {
+				t.Fatalf("usage = %+v, want %+v", usage, wantUsage)
+			}
+			if first.calls != 1 || next.calls != 0 {
+				t.Fatalf("physical calls native=%d fallback=%d, want 1/0", first.calls, next.calls)
+			}
+			if got := registry.Get(1).Fails; got != 1 {
+				t.Fatalf("native terminal error changed pool health: fails=%d, want 1", got)
+			}
+		})
+
+		t.Run(tc.name+"/stream", func(t *testing.T) {
+			nativeErr := &subscription.Error{
+				Code:    subscription.CodeAuthRequired,
+				Message: tc.message,
+				Status:  tc.status,
+			}
+			first := &terminalPoolProvider{err: nativeErr}
+			next := okProv("api-fallback", "must not run")
+			pool := New([]*Member{
+				member(1, "native-account", RankActive, first),
+				member(2, "api-fallback", 1, next),
+			}, NewRegistry(nil, nil))
+
+			_, err := drain(pool.Stream(context.Background(), llm.CompletionRequest{}))
+			var gotNative *subscription.Error
+			if !errors.As(err, &gotNative) {
+				t.Fatalf("error = %T %v, want wrapped native terminal error", err, err)
+			}
+			if first.calls != 1 || next.calls != 0 {
+				t.Fatalf("physical calls native=%d fallback=%d, want 1/0", first.calls, next.calls)
+			}
+		})
+	}
+}
+
+func TestNativeTerminalCompletePreservesEarlierAttemptUsage(t *testing.T) {
+	firstUsage := llm.Usage{InputTokens: 7, OutputTokens: 1}
+	nativeUsage := llm.Usage{InputTokens: 11, OutputTokens: 3}
+	first := &terminalPoolProvider{
+		err:   errors.New("legacy API: status 503: unavailable"),
+		usage: firstUsage,
+	}
+	native := &terminalPoolProvider{
+		err: &subscription.Error{
+			Code:    subscription.CodeAuthRequired,
+			Message: "native request ended without a response",
+		},
+		usage: nativeUsage,
+	}
+	next := okProv("another-api", "must not run")
+	pool := New([]*Member{
+		member(1, "legacy-api", RankActive, first),
+		member(2, "native-account", 2, native),
+		member(3, "another-api", 1, next),
+	}, NewRegistry(nil, nil))
+
+	_, _, usage, err := pool.Complete(context.Background(), llm.CompletionRequest{})
+	if !subscription.IsTerminal(err) {
+		t.Fatalf("error = %T %v, want native terminal error", err, err)
+	}
+	wantUsage := firstUsage
+	wantUsage.Add(nativeUsage)
+	if usage != wantUsage {
+		t.Fatalf("usage = %+v, want %+v", usage, wantUsage)
+	}
+	if first.calls != 1 || native.calls != 1 || next.calls != 0 {
+		t.Fatalf("physical calls legacy=%d native=%d next=%d, want 1/1/0", first.calls, native.calls, next.calls)
+	}
+}
+
+func TestLegacy503StillChangesPoolAccount(t *testing.T) {
+	first := failProv("legacy-api", 503)
+	next := okProv("api-fallback", "fallback")
+	pool := New([]*Member{
+		member(1, "legacy-api", RankActive, first),
+		member(2, "api-fallback", 1, next),
+	}, NewRegistry(nil, nil))
+
+	_, _, _, err := pool.Complete(context.Background(), llm.CompletionRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.calls != 1 || next.calls != 1 {
+		t.Fatalf("physical calls legacy=%d fallback=%d, want 1/1", first.calls, next.calls)
 	}
 }

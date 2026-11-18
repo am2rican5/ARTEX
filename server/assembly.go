@@ -10,9 +10,9 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/internal/norma/skill"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 	"github.com/Autumn-27/artex/traffic"
-	"github.com/Autumn-27/norma/skill"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 // mcpUntrustedNote is appended to every MCP tool description: a one-line

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,9 +24,10 @@ import (
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
+	"github.com/Autumn-27/artex/subscription"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/artex/traffic/rewrite"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 // Task is one engagement: a description + goal + its own exploration store,
@@ -70,6 +72,8 @@ type Task struct {
 	CoverageEnabled      bool                   `json:"coverage_enabled"`       // asset coverage feature switch (fixed at creation, on by default)
 	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
+	NativeUsed           bool                   `json:"-"`
+	NativeRecoveryHold   bool                   `json:"-"`
 	Store                *pgdb.ExplorationStore `json:"-"`
 	Guard                *guard.Guard           `json:"-"`
 	TargetGuard          *guard.Guard           `json:"-"` // planner and main-agent hooks: target gate only
@@ -93,20 +97,22 @@ type Task struct {
 // updateLifecycle instead of reading or writing the corresponding Task fields
 // directly after the task has been published by Manager.
 type taskLifecycleState struct {
-	Name          string
-	PinnedAt      int64
-	Status        string
-	Paused        bool
-	Queued        bool
-	QueuedAt      int64
-	QueueMode     string
-	CompletedAt   int64
-	FirstRunAt    int64
-	DeadlineAt    int64
-	SourceTaskIDs []int64
-	CompanyIDs    []int64
-	CategoryID    *int64
-	CategoryName  string
+	Name               string
+	PinnedAt           int64
+	Status             string
+	Paused             bool
+	Queued             bool
+	QueuedAt           int64
+	QueueMode          string
+	CompletedAt        int64
+	FirstRunAt         int64
+	DeadlineAt         int64
+	NativeUsed         bool
+	NativeRecoveryHold bool
+	SourceTaskIDs      []int64
+	CompanyIDs         []int64
+	CategoryID         *int64
+	CategoryName       string
 }
 
 func (t *Task) lifecycleSnapshot() taskLifecycleState {
@@ -120,20 +126,22 @@ func (t *Task) lifecycleSnapshot() taskLifecycleState {
 
 func (t *Task) lifecycleSnapshotLocked() taskLifecycleState {
 	return taskLifecycleState{
-		Name:          t.Name,
-		PinnedAt:      t.PinnedAt,
-		Status:        t.Status,
-		Paused:        t.Paused,
-		Queued:        t.Queued,
-		QueuedAt:      t.QueuedAt,
-		QueueMode:     t.QueueMode,
-		CompletedAt:   t.CompletedAt,
-		FirstRunAt:    t.FirstRunAt,
-		DeadlineAt:    t.DeadlineAt,
-		SourceTaskIDs: append([]int64(nil), t.SourceTaskIDs...),
-		CompanyIDs:    append([]int64(nil), t.CompanyIDs...),
-		CategoryID:    cloneInt64Ptr(t.CategoryID),
-		CategoryName:  t.CategoryName,
+		Name:               t.Name,
+		PinnedAt:           t.PinnedAt,
+		Status:             t.Status,
+		Paused:             t.Paused,
+		Queued:             t.Queued,
+		QueuedAt:           t.QueuedAt,
+		QueueMode:          t.QueueMode,
+		CompletedAt:        t.CompletedAt,
+		FirstRunAt:         t.FirstRunAt,
+		DeadlineAt:         t.DeadlineAt,
+		NativeUsed:         t.NativeUsed,
+		NativeRecoveryHold: t.NativeRecoveryHold,
+		SourceTaskIDs:      append([]int64(nil), t.SourceTaskIDs...),
+		CompanyIDs:         append([]int64(nil), t.CompanyIDs...),
+		CategoryID:         cloneInt64Ptr(t.CategoryID),
+		CategoryName:       t.CategoryName,
 	}
 }
 
@@ -154,6 +162,8 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.CompletedAt = state.CompletedAt
 	t.FirstRunAt = state.FirstRunAt
 	t.DeadlineAt = state.DeadlineAt
+	t.NativeUsed = state.NativeUsed
+	t.NativeRecoveryHold = state.NativeRecoveryHold
 	t.SourceTaskIDs = append(t.SourceTaskIDs[:0], state.SourceTaskIDs...)
 	t.CompanyIDs = append(t.CompanyIDs[:0], state.CompanyIDs...)
 	t.CategoryID = cloneInt64Ptr(state.CategoryID)
@@ -254,12 +264,13 @@ type DeleteTaskResult struct {
 // Manager owns the PostgreSQL data source (asset graph + every task's exploration
 // graph + config) and the in-memory set of task handles.
 type Manager struct {
-	dir         string
-	pg          *pgdb.DB
-	assets      *pgdb.AssetStore
-	traffic     *traffic.Traffic       // process-wide recording proxy (may be nil)
-	enrich      *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
-	interceptor *intercept.Interceptor // user-configured tool-call interception rules
+	dir           string
+	pg            *pgdb.DB
+	assets        *pgdb.AssetStore
+	subscriptions *subscription.Manager
+	traffic       *traffic.Traffic       // process-wide recording proxy (may be nil)
+	enrich        *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
+	interceptor   *intercept.Interceptor // user-configured tool-call interception rules
 
 	// Capture-proxy rewrite rules: rewriteMu serializes reloads, rewriteSet is
 	// the snapshot last compiled, rewriteErrors outlives the reloads.
@@ -334,6 +345,11 @@ const (
 	defaultConcurrencyLimit = 5
 )
 
+// nativeAuthCloseTimeout exceeds one provider operation (30s) plus both
+// possible callback-listener stop bounds (5s each), while staying below the
+// deployment's two-minute termination grace period.
+const nativeAuthCloseTimeout = 60 * time.Second
+
 // ConcurrencyLimit returns whether the simultaneous-running-task cap is enabled and
 // its limit (default 5 when enabled but unset). limit is always >=1 when enabled.
 func (m *Manager) ConcurrencyLimit() (enabled bool, limit int) {
@@ -386,6 +402,17 @@ func (m *Manager) SetWorkers(n int) error {
 // Enrich returns the asset auto-completion engine (may be nil if init failed).
 func (m *Manager) Enrich() *enrich.Engine { return m.enrich }
 
+// Subscriptions returns the process-wide native credential manager. Manually
+// assembled API-key-only test Managers may leave it nil.
+func (m *Manager) Subscriptions() *subscription.Manager {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.subscriptions
+}
+
 // NewManager connects to PostgreSQL and, if proxyAddr is non-empty, starts the
 // traffic-recording proxy. PostgreSQL is required (it is the single data source).
 func NewManager(dir, proxyAddr string) (*Manager, error) {
@@ -426,7 +453,29 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err := pg.EnsureLLMUsageTable(); err != nil {
 		log.Printf("[llmusage] create table: %v", err)
 	}
-	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
+	authTransport := http.DefaultTransport
+	if transport, ok := authTransport.(*http.Transport); ok {
+		authTransport = transport.Clone()
+	}
+	authClient := &http.Client{
+		Transport: authTransport,
+		Timeout:   30 * time.Second,
+	}
+	subscriptions := subscription.NewManager(pg, subscription.Options{
+		Drivers: []subscription.OAuthDriver{
+			subscription.NewClaudeOAuth(authClient),
+			subscription.NewCodexOAuth(authClient),
+		},
+		CallbackListenHost: strings.TrimSpace(os.Getenv("ARTEX_OAUTH_CALLBACK_LISTEN_HOST")),
+	})
+	m := &Manager{
+		dir:           dir,
+		pg:            pg,
+		assets:        pg.Assets(),
+		subscriptions: subscriptions,
+		tasks:         map[string]*Task{},
+		interceptor:   intercept.New(pg),
+	}
 	// Behind the global egress proxy a target approval is name-only.
 	m.interceptor.SetUpstreamProxyCheck(func() bool { return m.GlobalProxy() != "" })
 	// The platform's own endpoints need no target approval.
@@ -449,7 +498,15 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 				return task == nil, nil
 			})
 			if err != nil {
-				_ = tr.Close()
+				closeCtx, cancel := context.WithTimeout(context.Background(), nativeAuthCloseTimeout)
+				closeErr := subscriptions.Close(closeCtx)
+				cancel()
+				if closeErr != nil {
+					return nil, errors.Join(
+						fmt.Errorf("recover traffic delete staging: %w", err),
+						fmt.Errorf("drain native authentication: %w", closeErr),
+					)
+				}
 				_ = pg.Close()
 				return nil, fmt.Errorf("recover traffic delete staging: %w", err)
 			}
@@ -620,20 +677,20 @@ func (m *Manager) WebSearchOpts() agent.WebSearchOpts {
 	o := agent.WebSearchOpts{Enabled: on, Backend: backend, BraveKey: braveKey, TavilyKey: tavilyKey, Proxy: proxy}
 	if backend == deepSeekWebSearchBackend {
 		o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel = m.deepSeekSearchCreds()
+		if strings.TrimSpace(o.DeepSeekAPIKey) == "" {
+			o.Enabled = false
+		}
 	}
 	return o
 }
 
-// deepSeekSearchCreds resolves the credentials the "deepseek" search backend
-// borrows from the active LLM profile (it has no key of its own). Whether that
-// profile can actually drive server-side search — DeepSeek exposes it only on
-// the Anthropic-format endpoint — is deliberately NOT validated here: the UI
-// states the requirement and the user decides. A profile that can't serve it
-// simply fails at search time (or at the settings page's Test button), which is
-// the same feedback every other backend gives for a bad key.
+// deepSeekSearchCreds resolves the raw credentials the "deepseek" search
+// backend borrows from an API-key active LLM profile. Native OAuth profiles
+// deliberately return no credentials: provider bearer tokens remain owned by
+// subscription.Manager and are never repurposed for tool traffic.
 func (m *Manager) deepSeekSearchCreds() (baseURL, apiKey, model string) {
 	p, err := m.pg.ActiveProfile()
-	if err != nil || p == nil {
+	if err != nil || p == nil || p.AuthMode == "oauth" {
 		return "", "", ""
 	}
 	return p.BaseURL, p.APIKey, p.Model
@@ -858,13 +915,58 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 	return nil
 }
 
-func (m *Manager) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.traffic != nil {
-		m.traffic.Close()
+// BeginNativeShutdown rejects new native requests and starts canceling active
+// model calls without waiting for credential refresh, authorization exchange,
+// or their persistence. Close later joins that same native-manager drain before
+// closing PostgreSQL.
+func (m *Manager) BeginNativeShutdown() {
+	if m == nil {
+		return
 	}
-	return m.pg.Close()
+	m.mu.RLock()
+	subscriptions := m.subscriptions
+	m.mu.RUnlock()
+	if subscriptions == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = subscriptions.Close(ctx)
+}
+
+// Close stops native admission, cancels credential-scoped model calls, and
+// drains OAuth exchange/refresh persistence before the database is closed.
+func (m *Manager) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	trafficRecorder := m.traffic
+	m.traffic = nil
+	subscriptions := m.subscriptions
+	pg := m.pg
+	m.mu.Unlock()
+
+	if trafficRecorder != nil {
+		trafficRecorder.Close()
+	}
+	if subscriptions != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), nativeAuthCloseTimeout)
+		closeErr := subscriptions.Close(closeCtx)
+		cancel()
+		if closeErr != nil {
+			return closeErr
+		}
+		m.mu.Lock()
+		if m.subscriptions == subscriptions {
+			m.subscriptions = nil
+		}
+		m.mu.Unlock()
+	}
+	if pg != nil {
+		return pg.Close()
+	}
+	return nil
 }
 
 // isTerminalStatus reports whether a task status is terminal (done/failed/timeout).
@@ -905,6 +1007,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		PlanQuietMode:   pt.PlanQuietMode,
 		CoverageEnabled: pt.CoverageEnabled,
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
+		NativeUsed: pt.NativeUsed, NativeRecoveryHold: pt.NativeRecoveryHold,
 		Store: store, Guard: guard.NewWithInterceptor(ic), TargetGuard: guard.NewTargetOnly(ic), notify: make(chan struct{}, 1),
 		interceptor: ic,
 	}
@@ -1246,65 +1349,21 @@ func (m *Manager) SetTaskPaused(id string, paused bool) error {
 // preservePosition applies only when the row is already queued. A repeated
 // admission keeps its FIFO timestamp; a task that was explicitly paused and is
 // now re-queued receives a fresh tail position.
-func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued bool, mode string, preservePosition bool) error {
+func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued bool, mode string, preservePosition, acknowledgeNativeRecovery bool) error {
 	m.taskStateMu.Lock()
 	defer m.taskStateMu.Unlock()
 	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
 		return err
 	}
-	if queued {
-		if mode != "bootstrap" && mode != "resume" {
-			return fmt.Errorf("invalid queue mode %q", mode)
-		}
-	} else {
-		mode = ""
-	}
-
-	var queuedAt, completedAt, firstRunAt, deadlineAt sql.NullTime
-	var committedMode string
-	err = m.pg.QueryRow(`UPDATE tasks
-	SET status=$2,
-	    completed_at=CASE
-	        WHEN $2 IN ('done','failed','timeout') THEN COALESCE(completed_at, now())
-	        ELSE NULL
-	    END,
-	    paused=false,
-	    queued=$3,
-	    queued_at=CASE
-	        WHEN NOT $3 THEN NULL
-	        WHEN $5 AND queued THEN COALESCE(queued_at, now())
-	        ELSE now()
-	    END,
-	    queue_mode=CASE
-	        WHEN NOT $3 THEN ''
-	        WHEN ($5 AND queued AND queue_mode='bootstrap') OR $4='bootstrap' THEN 'bootstrap'
-	        ELSE 'resume'
-	    END,
-	    first_run_at=CASE
-	        WHEN $6='timeout' AND $2 NOT IN ('done','failed','timeout') THEN NULL
-	        ELSE first_run_at
-	    END,
-	    deadline_at=CASE
-	        WHEN $6='timeout' AND $2 NOT IN ('done','failed','timeout') THEN NULL
-	        -- Leaving the paused state: credit the paused interval back onto the
-	        -- deadline so the timeout budget only counts running time (#1).
-	        WHEN paused_at IS NOT NULL AND deadline_at IS NOT NULL THEN deadline_at + (now() - paused_at)
-	        ELSE deadline_at
-	    END,
-	    paused_at=NULL,
-	    -- A revive (terminal -> non-terminal) starts a new run: drop the previous
-	    -- run's end reason (e.g. budget) so it never marks the new one.
-	    end_reason=CASE
-	        WHEN $2 NOT IN ('done','failed','timeout') THEN ''
-	        ELSE end_reason
-	    END
-	WHERE id=$1 AND deleted_at IS NULL AND status=$6
-	RETURNING queued_at, queue_mode, completed_at, first_run_at, deadline_at`, n, status, queued, mode, preservePosition, expectedStatus).
-		Scan(&queuedAt, &committedMode, &completedAt, &firstRunAt, &deadlineAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("task %s lifecycle changed before admission (expected status %q)", id, expectedStatus)
-	}
+	result, err := m.pg.ApplyTaskAdmission(context.Background(), n, pgdb.TaskAdmissionInput{
+		ExpectedStatus:            expectedStatus,
+		Status:                    status,
+		Queued:                    queued,
+		Mode:                      mode,
+		PreservePosition:          preservePosition,
+		AcknowledgeNativeRecovery: acknowledgeNativeRecovery,
+	})
 	if err != nil {
 		return err
 	}
@@ -1315,22 +1374,26 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 			state.Status = status
 			state.Paused = false
 			state.Queued = queued
-			state.QueueMode = committedMode
+			state.QueueMode = result.QueueMode
 			state.QueuedAt = 0
-			if queuedAt.Valid {
-				state.QueuedAt = queuedAt.Time.UnixNano()
+			if result.QueuedAt != nil {
+				state.QueuedAt = result.QueuedAt.UnixNano()
 			}
 			state.CompletedAt = 0
-			if completedAt.Valid {
-				state.CompletedAt = completedAt.Time.Unix()
+			if result.CompletedAt != nil {
+				state.CompletedAt = result.CompletedAt.Unix()
 			}
 			state.FirstRunAt = 0
-			if firstRunAt.Valid {
-				state.FirstRunAt = firstRunAt.Time.Unix()
+			if result.FirstRunAt != nil {
+				state.FirstRunAt = result.FirstRunAt.Unix()
 			}
 			state.DeadlineAt = 0
-			if deadlineAt.Valid {
-				state.DeadlineAt = deadlineAt.Time.Unix()
+			if result.DeadlineAt != nil {
+				state.DeadlineAt = result.DeadlineAt.Unix()
+			}
+			if acknowledgeNativeRecovery {
+				state.NativeUsed = false
+				state.NativeRecoveryHold = false
 			}
 		})
 	}

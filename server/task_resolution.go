@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/subscription"
 )
 
 type taskLLMResolution struct {
@@ -15,6 +16,27 @@ type taskLLMResolution struct {
 	Source    string `json:"source"`
 	Available bool   `json:"available"`
 	Reason    string `json:"reason,omitempty"`
+}
+
+// nativeProfileSelectionError preserves the selected-profile boundary around
+// providerForProfile's legacy bool result. A missing or unusable API-key profile
+// keeps the historical fallback behavior; a selected OAuth profile must remain
+// selected and surface a terminal native error instead.
+func (s *Server) nativeProfileSelectionError(profileID int64) error {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return fmt.Errorf("load selected LLM profile #%d: database unavailable", profileID)
+	}
+	profile, err := s.m.pg.ProfileByID(profileID)
+	if err != nil {
+		return fmt.Errorf("load selected LLM profile #%d: %w", profileID, err)
+	}
+	if profile == nil || profile.AuthMode != "oauth" {
+		return nil
+	}
+	return &subscription.Error{
+		Code:    subscription.CodeAuthRequired,
+		Message: fmt.Sprintf("selected native LLM profile #%d is unavailable", profileID),
+	}
 }
 
 func (s *Server) resolutionFromProfile(p *db.LLMProfile, source string) taskLLMResolution {
@@ -29,8 +51,9 @@ func (s *Server) resolutionFromProfile(p *db.LLMProfile, source string) taskLLMR
 		Model:     p.Model,
 		Source:    source,
 	}
-	// Ollama profiles are keyless by design; the other formats need a key.
-	if p.APIKey == "" && p.Format != "ollama" {
+	// OAuth and Ollama profiles are keyless by design. Legacy API profiles keep
+	// the existing missing-key fallback semantics.
+	if p.AuthMode != "oauth" && p.APIKey == "" && p.Format != "ollama" {
 		result.Reason = "LLM profile has no API Key set"
 		return result
 	}
@@ -63,6 +86,9 @@ func (s *Server) resolveTaskRoleLLM(t *Task, agentKey string) (taskLLMResolution
 			if resolved.Available {
 				return resolved, nil
 			}
+			if selectionErr := s.nativeProfileSelectionError(p.ID); selectionErr != nil {
+				return resolved, selectionErr
+			}
 		}
 	}
 	state := t.llmStateSnapshot()
@@ -74,7 +100,11 @@ func (s *Server) resolveTaskRoleLLM(t *Task, agentKey string) (taskLLMResolution
 		if err != nil {
 			return taskLLMResolution{}, fmt.Errorf("load task LLM profile: %w", err)
 		}
-		return s.resolutionFromProfile(p, "task_chain"), nil
+		resolved := s.resolutionFromProfile(p, "task_chain")
+		if selectionErr := s.nativeProfileSelectionError(*state.ActiveID); !resolved.Available && selectionErr != nil {
+			return resolved, selectionErr
+		}
+		return resolved, nil
 	}
 	p, err := s.m.pg.ActiveProfile()
 	if err != nil {
@@ -84,6 +114,9 @@ func (s *Server) resolveTaskRoleLLM(t *Task, agentKey string) (taskLLMResolution
 		resolved := s.resolutionFromProfile(p, "global_profile")
 		if resolved.Available {
 			return resolved, nil
+		}
+		if selectionErr := s.nativeProfileSelectionError(p.ID); selectionErr != nil {
+			return resolved, selectionErr
 		}
 	}
 	s.cfgMu.Lock()

@@ -2,13 +2,15 @@ package llmrec
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"iter"
 	"os"
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/transcript"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/transcript"
 	"github.com/google/uuid"
 )
 
@@ -65,6 +67,136 @@ func TestCompleteForwardsAtomicResponse(t *testing.T) {
 	}
 	if usage.InputTokens != 7 || usage.OutputTokens != 3 {
 		t.Fatalf("Complete() usage=%+v", usage)
+	}
+}
+
+func TestRecorderSerializesProviderStateAndCompletionTruth(t *testing.T) {
+	state := &llm.ProviderState{
+		Provider:  "openai-codex-oauth",
+		Model:     "codex-native",
+		AuthScope: "account:workspace",
+		Data:      json.RawMessage(`{"version":1,"reasoning":[{"id":"r1"}]}`),
+	}
+	msg := llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("answer")}, ProviderState: state}
+	recorder := Wrap(completeProvider{}, nil, "codex-native", "native", "", "", nil)
+	requestBody := recorder.serializeRequest(llm.CompletionRequest{Messages: []llm.Message{msg}})
+	var request struct {
+		Messages []llm.Message `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(requestBody), &request); err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Messages) != 1 || request.Messages[0].ProviderState == nil || string(request.Messages[0].ProviderState.Data) != string(state.Data) {
+		t.Fatalf("normalized request lost provider state: %s", requestBody)
+	}
+
+	responseBody := serializeResponse(msg, llm.Usage{InputTokens: 8, OutputTokens: 3}, "", false)
+	var response struct {
+		Message   llm.Message `json:"message"`
+		Completed bool        `json:"completed"`
+	}
+	if err := json.Unmarshal([]byte(responseBody), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Completed || response.Message.ProviderState == nil || string(response.Message.ProviderState.Data) != string(state.Data) {
+		t.Fatalf("partial normalized response changed completion/state: %s", responseBody)
+	}
+	response.Message.ProviderState.Data[0] = '['
+	if state.Data[0] != '{' {
+		t.Fatal("serialized response aliases the provider-owned state")
+	}
+}
+
+type nativeErrorProvider struct {
+	completeProvider
+	err error
+}
+
+func (p nativeErrorProvider) Complete(context.Context, llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("partial")}}, "", llm.Usage{InputTokens: 13, OutputTokens: 5}, p.err
+}
+
+func TestCompletePreservesNativeErrorUsage(t *testing.T) {
+	wantErr := errors.New("native terminal failure")
+	var metered []llm.Usage
+	ctx := WithUsageSink(t.Context(), func(usage llm.Usage) { metered = append(metered, usage) })
+	recorder := Wrap(nativeErrorProvider{err: wantErr}, nil, "native-model", "native", "", "", func() bool { return false })
+	msg, stop, usage, err := recorder.Complete(ctx, llm.CompletionRequest{})
+	if !errors.Is(err, wantErr) || stop != "" || msg.Text() != "partial" || usage != (llm.Usage{InputTokens: 13, OutputTokens: 5}) {
+		t.Fatalf("Complete()=(%+v,%q,%+v,%v)", msg, stop, usage, err)
+	}
+	if len(metered) != 1 || metered[0] != usage {
+		t.Fatalf("metered usage=%+v want one %+v", metered, usage)
+	}
+}
+
+type nativeStreamMetadataProvider struct {
+	completeProvider
+	state *llm.ProviderState
+	fail  bool
+}
+
+func (p nativeStreamMetadataProvider) Stream(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return func(yield func(llm.StreamEvent, error) bool) {
+		for _, event := range []llm.StreamEvent{
+			{Type: llm.SEMessageStart, Usage: llm.Usage{InputTokens: 31}},
+			{Type: llm.SEToolUseStart, ToolID: "a", ToolName: "read"},
+			{Type: llm.SEToolUseStart, ToolID: "b", ToolName: "read"},
+			{Type: llm.SEToolInputJSON, ToolID: "b", Text: `{"n":2}`},
+			{Type: llm.SEToolInputJSON, ToolID: "a", Text: `{"n":1}`},
+			{Type: llm.SEProviderState, ProviderState: p.state},
+			{Type: llm.SEMessageDelta, StopReason: "tool_use", Usage: llm.Usage{OutputTokens: 7}},
+		} {
+			if !yield(event, nil) {
+				return
+			}
+		}
+		if p.fail {
+			yield(llm.StreamEvent{}, errors.New("native stream failed"))
+			return
+		}
+		yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
+	}
+}
+
+func TestStreamForwardsNativeMetadataWithoutFalseCompletion(t *testing.T) {
+	state := &llm.ProviderState{
+		Provider: "openai-codex-oauth", Model: "codex-native", AuthScope: "account:workspace",
+		Data: json.RawMessage(`{"version":1,"reasoning":[{"id":"r1"}]}`),
+	}
+	recorder := Wrap(nativeStreamMetadataProvider{state: state}, nil, "native-model", "native", "", "", func() bool { return false })
+	acc := llm.NewAccumulator()
+	for event, err := range recorder.Stream(t.Context(), llm.CompletionRequest{}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		acc.Add(event)
+	}
+	msg := acc.Message()
+	uses := msg.ToolUses()
+	if len(uses) != 2 || string(uses[0].Input) != `{"n":1}` || string(uses[1].Input) != `{"n":2}` || msg.ProviderState == nil {
+		t.Fatalf("recorder changed native stream metadata: message=%+v", msg)
+	}
+
+	var metered []llm.Usage
+	ctx := WithUsageSink(t.Context(), func(usage llm.Usage) { metered = append(metered, usage) })
+	failed := Wrap(nativeStreamMetadataProvider{state: state, fail: true}, nil, "native-model", "native", "", "", func() bool { return false })
+	stops := 0
+	var streamErr error
+	for event, err := range failed.Stream(ctx, llm.CompletionRequest{}) {
+		if event.Type == llm.SEMessageStop {
+			stops++
+		}
+		if err != nil {
+			streamErr = err
+		}
+	}
+	if streamErr == nil || stops != 0 {
+		t.Fatalf("partial native stream err=%v stops=%d", streamErr, stops)
+	}
+	wantUsage := llm.Usage{InputTokens: 31, OutputTokens: 7}
+	if len(metered) != 1 || metered[0] != wantUsage {
+		t.Fatalf("partial native usage=%+v want one %+v", metered, wantUsage)
 	}
 }
 

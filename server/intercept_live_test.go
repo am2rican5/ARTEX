@@ -11,7 +11,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 // Opt-in model regression: sends synthetic review inputs only, never executes
@@ -35,7 +35,7 @@ func TestLiveContextReview(t *testing.T) {
 	if json.Unmarshal(b, &cfg) != nil || cfg.Judge.APIKey == "" {
 		t.Fatal("invalid live model config")
 	}
-	provider, err := (agent.Config{Format: llm.FormatOpenAI, BaseURL: cfg.Judge.BaseURL, APIKey: cfg.Judge.APIKey, Model: cfg.Judge.Model}).NewProvider()
+	provider, err := (agent.Config{Format: llm.FormatOpenAI, BaseURL: cfg.Judge.BaseURL, APIKey: cfg.Judge.APIKey, Model: cfg.Judge.Model}).NewProvider(nil)
 	if err != nil {
 		t.Fatal("cannot create live review provider")
 	}

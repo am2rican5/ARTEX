@@ -25,9 +25,10 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/skill"
 	"github.com/Autumn-27/artex/notify"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/skill"
+	"github.com/Autumn-27/artex/subscription"
 )
 
 // validSkillName checks the agentskills.io name constraints, widened so a skill can
@@ -1957,64 +1958,262 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	// APIKey has json:"-" on db.LLMProfile so it is never leaked to the UI on
-	// read; accept it here via a sibling field for create/update. Streaming is a
-	// *bool shadowing the embedded json:"streaming": an absent field must default
-	// to streaming (true), which a plain bool zero value (false = non-streaming)
-	// would get wrong — legacy/partial clients that never send it stay streaming.
+	// Pointer/raw shadows preserve update intent: omitted mode/reference keeps the
+	// stored binding, explicit null clears the reference, and a value connects it.
+	// Price pointers similarly keep API-key pricing when an older client omits it.
 	var body struct {
 		db.LLMProfile
-		APIKey    string `json:"api_key"`
-		Streaming *bool  `json:"streaming"`
+		APIKey              string          `json:"api_key"`
+		BaseURL             *string         `json:"base_url"`
+		UserAgent           *string         `json:"user_agent"`
+		Streaming           *bool           `json:"streaming"`
+		AuthMode            *string         `json:"auth_mode"`
+		CredentialID        json.RawMessage `json:"credential_id"`
+		PoolExclude         *bool           `json:"pool_exclude"`
+		PriceInputPerM      *float64        `json:"price_input_per_m"`
+		PriceOutputPerM     *float64        `json:"price_output_per_m"`
+		PriceCacheReadPerM  *float64        `json:"price_cache_read_per_m"`
+		PriceCacheWritePerM *float64        `json:"price_cache_write_per_m"`
 	}
 	if err := decode(r, &body); err != nil {
-		writeErr(w, 400, err.Error())
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	p := body.LLMProfile
 	p.APIKey = body.APIKey
-	p.Streaming = body.Streaming == nil || *body.Streaming
+
+	var stored *db.LLMProfile
+	if p.ID > 0 {
+		var err error
+		stored, err = pg.ProfileByID(p.ID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "could not read LLM profile")
+			return
+		}
+		if stored == nil {
+			writeErr(w, http.StatusNotFound, db.ErrLLMProfileNotFound.Error())
+			return
+		}
+	}
+
+	if body.BaseURL != nil {
+		p.BaseURL = *body.BaseURL
+	} else if stored != nil {
+		p.BaseURL = stored.BaseURL
+	}
+	if body.UserAgent != nil {
+		p.UserAgent = *body.UserAgent
+	} else if stored != nil {
+		p.UserAgent = stored.UserAgent
+	}
+
+	if body.Streaming != nil {
+		p.Streaming = *body.Streaming
+	} else {
+		p.Streaming = stored == nil || stored.Streaming
+	}
+	if body.AuthMode != nil {
+		p.AuthMode = strings.TrimSpace(*body.AuthMode)
+	} else if stored != nil {
+		p.AuthMode = stored.AuthMode
+	}
+	if p.AuthMode == "" {
+		p.AuthMode = "api_key"
+	}
+	switch {
+	case len(body.CredentialID) == 0 && stored != nil:
+		p.CredentialID = stored.CredentialID
+	case len(body.CredentialID) == 0:
+		p.CredentialID = nil
+	default:
+		var credentialID *int64
+		if err := json.Unmarshal(body.CredentialID, &credentialID); err != nil || (credentialID != nil && *credentialID <= 0) {
+			writeErr(w, http.StatusBadRequest, "credential_id must be a positive number or null")
+			return
+		}
+		p.CredentialID = credentialID
+	}
+	if body.PoolExclude != nil {
+		p.PoolExclude = *body.PoolExclude
+	} else if p.AuthMode == "oauth" && (stored == nil || stored.AuthMode != "oauth") {
+		// A newly native profile is explicitly selectable but never joins
+		// automatic failover unless the operator opts in.
+		p.PoolExclude = true
+	} else if stored != nil {
+		p.PoolExclude = stored.PoolExclude
+	}
+	if body.PriceInputPerM != nil {
+		p.PriceInputPerM = *body.PriceInputPerM
+	} else if stored != nil {
+		p.PriceInputPerM = stored.PriceInputPerM
+	}
+	if body.PriceOutputPerM != nil {
+		p.PriceOutputPerM = *body.PriceOutputPerM
+	} else if stored != nil {
+		p.PriceOutputPerM = stored.PriceOutputPerM
+	}
+	if body.PriceCacheReadPerM != nil {
+		p.PriceCacheReadPerM = *body.PriceCacheReadPerM
+	} else if stored != nil {
+		p.PriceCacheReadPerM = stored.PriceCacheReadPerM
+	}
+	if body.PriceCacheWritePerM != nil {
+		p.PriceCacheWritePerM = *body.PriceCacheWritePerM
+	} else if stored != nil {
+		p.PriceCacheWritePerM = stored.PriceCacheWritePerM
+	}
+
 	// The list returns the proxy masked: the placeholder sent back keeps the
 	// stored proxy and is never stored itself.
 	if isMaskedSecret(p.Proxy) {
-		stored, err := pg.ProfileByID(p.ID)
-		if p.ID == 0 || err != nil || stored == nil {
-			writeErr(w, 400, "proxy is a masked placeholder but no stored proxy to keep; enter the proxy or clear it")
+		if stored == nil {
+			writeErr(w, http.StatusBadRequest, "proxy is a masked placeholder but no stored proxy to keep; enter the proxy or clear it")
 			return
 		}
 		p.Proxy = stored.Proxy
 	}
-	// Output cap: negative values are meaningless, clamp to zero (= do not send the
-	// field). The field-name switch only matters for Chat Completions — anthropic and
-	// openai-responses hard-code their field names; storing it would only mislead later readers, so it is cleared for any non-openai format. Unknown values are cleared too, to avoid throwing DB CHECK errors at the user.
-	if p.MaxTokens < 0 {
-		p.MaxTokens = 0
+
+	switch p.AuthMode {
+	case "oauth":
+		if body.BaseURL != nil && strings.TrimSpace(*body.BaseURL) != "" {
+			writeErr(w, http.StatusBadRequest, "native OAuth profiles use the provider's fixed endpoint; base_url is not supported")
+			return
+		}
+		if body.UserAgent != nil && strings.TrimSpace(*body.UserAgent) != "" {
+			writeErr(w, http.StatusBadRequest, "native OAuth profiles use the provider-required User-Agent; user_agent is not supported")
+			return
+		}
+		// Omitted values may be inherited from an API-key profile during a mode
+		// switch. Clear those old operator controls rather than carrying them into
+		// the native identity.
+		p.BaseURL = ""
+		p.UserAgent = ""
+		if err := validateNativeProfile(r.Context(), pg, &p); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	case "api_key":
+		if p.CredentialID != nil {
+			writeErr(w, http.StatusBadRequest, "credential_id requires auth_mode oauth")
+			return
+		}
+		if stored != nil && stored.AuthMode == "oauth" && p.Format != "ollama" && strings.TrimSpace(p.APIKey) == "" {
+			writeErr(w, http.StatusBadRequest, "switching from OAuth to API key authentication requires an explicit API key")
+			return
+		}
+		if p.MaxTokens < 0 {
+			p.MaxTokens = 0
+		}
+		if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
+			p.MaxTokensField = ""
+		}
+	default:
+		writeErr(w, http.StatusBadRequest, "auth_mode must be api_key or oauth")
+		return
 	}
-	if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
-		p.MaxTokensField = ""
-	}
-	// Custom User-Agent: trim and reject control characters / over-long values so a
-	// bad value can never inject a header or bloat every request. "" = no override.
+
 	ua, err := agent.ValidateUserAgent(p.UserAgent)
 	if err != nil {
-		writeErr(w, 400, err.Error())
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	p.UserAgent = ua
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// Editing a profile rebuilds any task pinned to it on its next round. Reapply
-	// the active profile too: the global fallback and explicit task chains must
-	// repopulate the same provider-cache entry and therefore share one limiter.
 	s.invalidateProfileAgents()
-	// Hot-apply. Not just when the ACTIVE profile changed: with failover on, any
-	// profile's key/model/priority/pool_exclude edit reshapes the chain, so the
-	// engine's provider has to be rebuilt either way.
 	s.reapplyActiveProfile()
-	writeJSON(w, 200, map[string]any{"id": id})
+	writeJSON(w, http.StatusOK, map[string]any{"id": id})
+}
+
+func validateNativeProfile(ctx context.Context, pg *db.DB, profile *db.LLMProfile) error {
+	if profile.CredentialID == nil || *profile.CredentialID <= 0 {
+		return errors.New("OAuth LLM profile requires a credential")
+	}
+	credential, err := llmCredentialMetadata(ctx, pg, *profile.CredentialID)
+	if err != nil {
+		return errors.New("could not read OAuth credential")
+	}
+	if credential == nil {
+		return errors.New("OAuth credential was not found")
+	}
+	expectedFormat := ""
+	switch credential.Provider {
+	case subscription.ProviderClaude:
+		expectedFormat = "anthropic"
+	case subscription.ProviderCodex:
+		expectedFormat = "openai-responses"
+	default:
+		return errors.New("OAuth credential provider is unsupported")
+	}
+	if profile.Format != expectedFormat {
+		return fmt.Errorf("OAuth credential provider requires format %s", expectedFormat)
+	}
+	var selected subscription.Model
+	found := false
+	for _, candidate := range subscription.Models(credential.Provider) {
+		if candidate.ID == profile.Model {
+			selected = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		return errors.New("model is not in the selected provider's pinned catalog")
+	}
+	switch profile.ThinkingType {
+	case "", "enabled":
+	case "disabled":
+		if !selected.SupportsThinkingDisable {
+			return errors.New("selected model does not support disabling thinking")
+		}
+	default:
+		return errors.New("thinking_type is unsupported by the selected model")
+	}
+	if profile.ReasoningEffort != "" && !stringInProfileOptions(profile.ReasoningEffort, selected.ReasoningEfforts) {
+		return errors.New("reasoning_effort is unsupported by the selected model")
+	}
+	if profile.MaxTokens < 0 || (!selected.SupportsOutputCap && profile.MaxTokens != 0) || (profile.MaxTokens > 0 && profile.MaxTokens > selected.MaxOutputTokens) {
+		return errors.New("max_tokens is unsupported by the selected model")
+	}
+
+	// Native identities use provider-owned origins and headers. Clear values from
+	// a prior API-key profile rather than carrying a credential destination or
+	// spoofed native identity across the mode switch.
+	profile.BaseURL = ""
+	profile.UserAgent = ""
+	profile.APIKey = ""
+	profile.MaxTokensField = ""
+	profile.ContextWindowK = selected.ContextWindowK
+	profile.PriceInputPerM = 0
+	profile.PriceOutputPerM = 0
+	profile.PriceCacheReadPerM = 0
+	profile.PriceCacheWritePerM = 0
+	return nil
+}
+
+func llmCredentialMetadata(ctx context.Context, pg *db.DB, id int64) (*db.LLMCredential, error) {
+	credentials, err := pg.ListLLMCredentials(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range credentials {
+		if credentials[i].ID == id {
+			return &credentials[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func stringInProfileOptions(value string, options []string) bool {
+	for _, option := range options {
+		if option == value {
+			return true
+		}
+	}
+	return false
 }
 
 // pgGetLLMRetryPolicy returns the global retry policy (per-layer counts +
@@ -2155,42 +2354,79 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.llmPoolStatus())
 }
 
-// pgListModels fetches available models from the provider's API endpoint.
-// Supports OpenAI-format (GET /models), Anthropic-format (GET /v1/models) and
-// Ollama (keyless OpenAI-compatible GET /v1/models on the local server); for
-// Anthropic-compatible third parties (e.g. DeepSeek) whose model list lives only on
-// the OpenAI path, it falls back to the OpenAI endpoint at the stripped root.
+// pgListModels fetches API-key/Ollama model IDs from the configured endpoint.
+// Native OAuth returns the selected provider's pinned catalog and capabilities
+// without sending credential material or claiming account entitlement/quota.
+// Anthropic-compatible API-key providers retain their OpenAI-list fallback.
 func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider  string `json:"provider"` // "openai" | "anthropic" | "ollama"
-		BaseURL   string `json:"base_url"`
-		APIKey    string `json:"api_key"`
-		Proxy     string `json:"proxy"`
-		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
+		Provider     string `json:"provider"` // API format: "openai" | "openai-responses" | "anthropic" | "ollama"
+		BaseURL      string `json:"base_url"`
+		APIKey       string `json:"api_key"`
+		Proxy        string `json:"proxy"`
+		AuthMode     string `json:"auth_mode"`
+		ProfileID    *int64 `json:"profile_id"`    // stored API key or exact native profile
+		CredentialID *int64 `json:"credential_id"` // direct native selection requires auth_mode=oauth
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
+		return
+	}
+	var selectedProfile *db.LLMProfile
+	if req.ProfileID != nil {
+		var err error
+		selectedProfile, err = s.m.pg.ProfileByID(*req.ProfileID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "could not read LLM profile")
+			return
+		}
+		if selectedProfile == nil {
+			writeErr(w, http.StatusNotFound, db.ErrLLMProfileNotFound.Error())
+			return
+		}
+	}
+	requestedAuthMode := strings.TrimSpace(req.AuthMode)
+	authMode := requestedAuthMode
+	if selectedProfile != nil {
+		storedAuthMode := selectedProfile.AuthMode
+		if storedAuthMode == "" {
+			storedAuthMode = "api_key"
+		}
+		if requestedAuthMode != "" && requestedAuthMode != storedAuthMode {
+			writeErr(w, http.StatusBadRequest, "auth_mode does not match the selected profile")
+			return
+		}
+		if authMode == "" {
+			authMode = storedAuthMode
+		}
+	}
+	if authMode == "oauth" {
+		s.writeNativeModelCatalog(w, r, strings.TrimSpace(req.Provider), req.CredentialID, selectedProfile)
+		return
+	}
+	if authMode != "" && authMode != "api_key" {
+		writeErr(w, http.StatusBadRequest, "auth_mode must be api_key or oauth")
+		return
+	}
+	if req.CredentialID != nil {
+		writeErr(w, http.StatusBadRequest, "credential_id requires auth_mode oauth")
 		return
 	}
 	// Resolve API key: form input > profile stored key. The stored key is only
 	// sent to the endpoint it was saved for, since base_url comes from the form.
 	apiKey := strings.TrimSpace(req.APIKey)
 	withheld := false
-	if apiKey == "" && req.ProfileID != nil {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			if sameLLMEndpoint(req.Provider, req.BaseURL, p.Format, p.BaseURL) {
-				apiKey = p.APIKey
-			} else {
-				withheld = p.APIKey != ""
-			}
+	if apiKey == "" && selectedProfile != nil {
+		if sameLLMEndpoint(req.Provider, req.BaseURL, selectedProfile.Format, selectedProfile.BaseURL) {
+			apiKey = selectedProfile.APIKey
+		} else {
+			withheld = selectedProfile.APIKey != ""
 		}
 	}
 	if isMaskedSecret(req.Proxy) { // the form echoes the masked proxy: use the stored one
 		req.Proxy = ""
-		if req.ProfileID != nil {
-			if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-				req.Proxy = p.Proxy
-			}
+		if selectedProfile != nil {
+			req.Proxy = selectedProfile.Proxy
 		}
 	}
 	provider := strings.TrimSpace(req.Provider)
@@ -2328,6 +2564,66 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		lastErr = "no model list received"
 	}
 	writeJSON(w, 200, map[string]any{"ok": false, "error": lastErr})
+}
+
+func (s *Server) writeNativeModelCatalog(w http.ResponseWriter, r *http.Request, format string, requestedCredentialID *int64, profile *db.LLMProfile) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	var credentialID int64
+	if profile != nil {
+		if profile.AuthMode != "oauth" || profile.CredentialID == nil {
+			writeErr(w, http.StatusBadRequest, "selected profile is not an OAuth profile")
+			return
+		}
+		credentialID = *profile.CredentialID
+		if requestedCredentialID != nil && *requestedCredentialID != credentialID {
+			writeErr(w, http.StatusBadRequest, "credential_id does not match the selected profile")
+			return
+		}
+		if format == "" {
+			format = profile.Format
+		} else if format != profile.Format {
+			writeErr(w, http.StatusBadRequest, "provider format does not match the selected profile")
+			return
+		}
+	} else {
+		if requestedCredentialID == nil || *requestedCredentialID <= 0 {
+			writeErr(w, http.StatusBadRequest, "credential_id is required for OAuth model candidates")
+			return
+		}
+		credentialID = *requestedCredentialID
+	}
+	credential, err := llmCredentialMetadata(r.Context(), pg, credentialID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read OAuth credential")
+		return
+	}
+	if credential == nil {
+		writeErr(w, http.StatusNotFound, "OAuth credential was not found")
+		return
+	}
+	expectedFormat := ""
+	switch credential.Provider {
+	case subscription.ProviderClaude:
+		expectedFormat = "anthropic"
+	case subscription.ProviderCodex:
+		expectedFormat = "openai-responses"
+	default:
+		writeErr(w, http.StatusBadRequest, "OAuth credential provider is unsupported")
+		return
+	}
+	if format != expectedFormat {
+		writeErr(w, http.StatusBadRequest, "provider format does not match the selected OAuth credential")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"models":       subscription.Models(credential.Provider),
+		"source":       "pinned_catalog",
+		"availability": "unknown",
+	})
 }
 
 // --- prompt template helpers (Go text/template + catalog whitelist) ---

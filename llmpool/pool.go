@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 // Member is one LLM profile in the chain, already built into a provider (wrapped
@@ -87,6 +87,10 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 			emitted := false
 			var failed error
 			for ev, err := range m.Prov.Stream(ctx, req) {
+				if err != nil && autoFallbackDisabled(err) {
+					yield(ev, err)
+					return
+				}
 				if err != nil && !emitted && shouldFailover(ctx, err) {
 					failed = err
 					break // safe window: nothing reached the caller yet
@@ -130,11 +134,16 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
 	order := p.order(req)
 	var lastErr error
+	var failedUsage llm.Usage
 	for i, m := range order {
 		msg, sr, usage, err := m.Prov.Complete(ctx, req)
 		if err == nil {
 			p.health.Pass(m.ID)
 			return msg, sr, usage, nil
+		}
+		if autoFallbackDisabled(err) {
+			failedUsage.Add(usage)
+			return msg, sr, failedUsage, err
 		}
 		if !shouldFailover(ctx, err) {
 			// Non-failover error (e.g. ctx cancel, deterministic 4xx): surface as-is
@@ -142,6 +151,7 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 			p.health.Pass(m.ID)
 			return llm.Message{}, "", llm.Usage{}, err
 		}
+		failedUsage.Add(usage)
 		lastErr = err
 		hard := isHardFailure(err)
 		if p.health.Trip(m.ID, trimErr(err), hard) {
@@ -222,6 +232,16 @@ func statusOf(err error) int {
 	return code
 }
 
+type noAutoFallbackError interface {
+	error
+	NoAutoFallback() bool
+}
+
+func autoFallbackDisabled(err error) bool {
+	var marker noAutoFallbackError
+	return errors.As(err, &marker) && marker.NoAutoFallback()
+}
+
 // shouldFailover reports whether err justifies trying the next profile.
 //
 // Never fails over on context cancellation — that's the user stopping a task or a
@@ -230,6 +250,9 @@ func statusOf(err error) int {
 // over-long request fails identically everywhere.
 func shouldFailover(ctx context.Context, err error) bool {
 	if err == nil {
+		return false
+	}
+	if autoFallbackDisabled(err) {
 		return false
 	}
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -252,6 +275,9 @@ func shouldFailover(ctx context.Context, err error) bool {
 // keep failing until a human fixes it) rather than transient. Hard failures open
 // the breaker on the first occurrence.
 func isHardFailure(err error) bool {
+	if autoFallbackDisabled(err) {
+		return false
+	}
 	switch statusOf(err) {
 	case 401, 402, 403, 404:
 		return true

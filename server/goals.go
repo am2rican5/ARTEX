@@ -151,7 +151,7 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	// status: a concurrent terminal transition must win instead of being silently
 	// reported as a successful follow-up admission.
 	if !wasTerminal && !wasPaused && !wasQueued && s.engine.Started(t.ID) && (!enabled || ready) {
-		if err := s.m.ApplyTaskAdmission(t.ID, lifecycle.Status, lifecycle.Status, false, "resume", false); err != nil {
+		if err := s.m.ApplyTaskAdmission(t.ID, lifecycle.Status, lifecycle.Status, false, "resume", false, false); err != nil {
 			return false, err
 		}
 		s.startAdmittedTask(t, "resume")
@@ -185,7 +185,7 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	if wasTerminal {
 		status = "running"
 	}
-	if err := s.m.ApplyTaskAdmission(t.ID, lifecycle.Status, status, shouldQueue, mode, wasQueued); err != nil {
+	if err := s.m.ApplyTaskAdmission(t.ID, lifecycle.Status, status, shouldQueue, mode, wasQueued, requirePaused); err != nil {
 		if !engineWasPaused && !wasPaused && !wasQueued {
 			s.engine.Resume(t)
 		}
@@ -265,7 +265,7 @@ func (s *Server) reconcileConcurrency() {
 	if enabled {
 		for _, task := range s.m.List() {
 			lifecycle := task.lifecycleSnapshot()
-			if lifecycle.Queued || lifecycle.Paused || s.engine.IsPaused(task.ID) || s.engine.IsDeleting(task.ID) ||
+			if lifecycle.NativeRecoveryHold || lifecycle.Queued || lifecycle.Paused || s.engine.IsPaused(task.ID) || s.engine.IsDeleting(task.ID) ||
 				isTerminalStatus(lifecycle.Status) || s.engine.ReadyFor(task) || s.engine.ActiveLLMCalls(task.ID) > 0 {
 				continue
 			}
@@ -289,7 +289,7 @@ func (s *Server) reconcileConcurrency() {
 	queued := []queuedTask{}
 	for _, task := range s.m.List() {
 		lifecycle := task.lifecycleSnapshot()
-		if lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
+		if lifecycle.Queued && !lifecycle.NativeRecoveryHold && !isTerminalStatus(lifecycle.Status) {
 			queued = append(queued, queuedTask{task: task, lifecycle: lifecycle})
 		}
 	}
@@ -327,7 +327,7 @@ func (s *Server) reconcileConcurrency() {
 		// Keep FIFO order, but do not consume a concurrency slot for a task
 		// whose explicit chain/global provider is unavailable. It will be retried
 		// after the user configures or resets its LLM chain.
-		if lifecycle.Paused || (enabled && !s.engine.ReadyFor(task)) {
+		if lifecycle.NativeRecoveryHold || lifecycle.Paused || (enabled && !s.engine.ReadyFor(task)) {
 			continue
 		}
 		mode := lifecycle.QueueMode
@@ -340,7 +340,7 @@ func (s *Server) reconcileConcurrency() {
 		if !s.engine.beginTaskOperation(task.ID) {
 			continue
 		}
-		if err := s.m.ApplyTaskAdmission(task.ID, lifecycle.Status, lifecycle.Status, false, mode, false); err != nil {
+		if err := s.m.ApplyTaskAdmission(task.ID, lifecycle.Status, lifecycle.Status, false, mode, false, false); err != nil {
 			s.engine.decInflight(task.ID)
 			continue
 		}

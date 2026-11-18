@@ -22,8 +22,8 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/norma/llm"
-	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 // Step 1.8: the targets the custom tools render. The hook reads the parameters

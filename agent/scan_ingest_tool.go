@@ -11,8 +11,8 @@ import (
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
-	acperm "github.com/Autumn-27/norma/permission"
-	actool "github.com/Autumn-27/norma/tool"
+	acperm "github.com/Autumn-27/artex/internal/norma/permission"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 // scanMaxFileBytes caps the scanner output file read by ingest_scan_output.

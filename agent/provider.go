@@ -22,20 +22,27 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/internal/norma/agentcore"
+	"github.com/Autumn-27/artex/internal/norma/compaction"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	acperm "github.com/Autumn-27/artex/internal/norma/permission"
+	"github.com/Autumn-27/artex/internal/norma/transcript"
 	"github.com/Autumn-27/artex/llmrec"
-	"github.com/Autumn-27/norma/agentcore"
-	"github.com/Autumn-27/norma/compaction"
-	"github.com/Autumn-27/norma/llm"
-	acperm "github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/transcript"
+	"github.com/Autumn-27/artex/subscription"
 )
 
 // Config describes the LLM backend resolved from the environment.
 type Config struct {
-	Format  llm.Format
-	BaseURL string
-	APIKey  string
-	Model   string
+	// Native authentication keeps only stable, comparable references here.
+	// Token material and lifecycle ownership stay in subscription.Manager.
+	ProfileID             int64
+	AuthMode              string
+	CredentialID          int64
+	AuthBindingGeneration int64
+	Format                llm.Format
+	BaseURL               string
+	APIKey                string
+	Model                 string
 	// Proxy routes all LLM requests through the given proxy URL (http/https/socks5,
 	// optionally with user:pass@ credentials). Empty means direct — it does NOT
 	// fall back to the standard *_PROXY environment variables.
@@ -168,9 +175,12 @@ func normalizeOllamaBaseURL(raw string) string {
 	return b
 }
 
-// NeedsAPIKey reports whether this provider format requires an API key to be
-// usable. Ollama (local server) is keyless; every cloud format needs one.
-func (c Config) NeedsAPIKey() bool { return c.Format != FormatOllama }
+// NeedsAPIKey reports whether this configuration requires a raw API key.
+// Native OAuth and local Ollama profiles resolve credentials through their
+// dedicated paths and must never borrow an environment or global API key.
+func (c Config) NeedsAPIKey() bool {
+	return c.AuthMode != "oauth" && c.Format != FormatOllama
+}
 
 // CompactionWindow returns the model context window in TOKENS for compaction
 // thresholds, resolved from the user-configured size (ContextWindowK). 0/unset →
@@ -225,9 +235,10 @@ func FromEnv() (Config, bool) {
 	}
 
 	c := Config{
-		BaseURL: os.Getenv("ARTEX_LLM_BASE_URL"),
-		Model:   os.Getenv("ARTEX_LLM_MODEL"),
-		Proxy:   strings.TrimSpace(os.Getenv("ARTEX_LLM_PROXY")),
+		AuthMode: "api_key",
+		BaseURL:  os.Getenv("ARTEX_LLM_BASE_URL"),
+		Model:    os.Getenv("ARTEX_LLM_MODEL"),
+		Proxy:    strings.TrimSpace(os.Getenv("ARTEX_LLM_PROXY")),
 		// Streaming by default; ARTEX_LLM_STREAM=false/0/off explicitly switches to
 		// non-streaming.
 		Stream: !isFalsy(os.Getenv("ARTEX_LLM_STREAM")),
@@ -275,11 +286,12 @@ func FromEnv() (Config, bool) {
 // endpoint path itself), so a full endpoint URL is tolerated.
 func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 	c := Config{
-		Model:   strings.TrimSpace(model),
-		BaseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		APIKey:  strings.TrimSpace(apiKey),
-		Proxy:   strings.TrimSpace(proxy),
-		Stream:  true, // streaming by default; the caller overrides per profile
+		AuthMode: "api_key",
+		Model:    strings.TrimSpace(model),
+		BaseURL:  strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		APIKey:   strings.TrimSpace(apiKey),
+		Proxy:    strings.TrimSpace(proxy),
+		Stream:   true, // streaming by default; the caller overrides per profile
 	}
 	switch strings.TrimSpace(provider) {
 	case "openai":
@@ -341,10 +353,70 @@ func (c Config) Provider() string {
 	return "anthropic"
 }
 
-// NewProvider builds an llm.Provider from the config. When a rate is set, the
-// limiter lives on the single provider instance — so planner + all workers +
-// main agent (which share this provider) are bounded by one shared rate limit.
-func (c Config) NewProvider() (llm.Provider, error) {
+// NewProvider builds an llm.Provider from the config. Native OAuth selection is
+// resolved before Norma's built-in factory so an empty API key can never fall
+// through to environment-backed OpenAI or Anthropic credentials. When a rate is
+// set, the single returned provider owns the limiter shared by every consumer.
+func (c Config) NewProvider(auth *subscription.Manager) (llm.Provider, error) {
+	authMode := strings.TrimSpace(c.AuthMode)
+	if authMode == "" {
+		authMode = "api_key"
+	}
+	if authMode == "oauth" {
+		if auth == nil {
+			return nil, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "subscription manager is required"}
+		}
+		if c.ProfileID <= 0 || c.CredentialID <= 0 || c.AuthBindingGeneration < 0 {
+			return nil, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "native LLM profile binding is incomplete"}
+		}
+		if strings.TrimSpace(c.APIKey) != "" {
+			return nil, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "native LLM profiles cannot use an API key"}
+		}
+		if strings.TrimSpace(c.BaseURL) != "" {
+			return nil, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "native LLM profiles use the provider's fixed endpoint"}
+		}
+		if strings.TrimSpace(c.UserAgent) != "" {
+			return nil, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "native LLM profiles use the provider-required User-Agent"}
+		}
+		if c.Format == llm.FormatOpenAIResponses && c.MaxTokens != 0 {
+			return nil, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "Codex subscription profiles do not support an operator output cap"}
+		}
+		client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, "")
+		if err != nil {
+			return nil, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "native LLM proxy configuration is invalid"}
+		}
+		config := subscription.ProviderConfig{
+			Binding: subscription.Binding{
+				ProfileID:    c.ProfileID,
+				CredentialID: c.CredentialID,
+				Generation:   c.AuthBindingGeneration,
+			},
+			Model:           c.Model,
+			ThinkingType:    c.ThinkingType,
+			ReasoningEffort: c.ReasoningEffort,
+			HTTPClient:      client,
+		}
+		var provider llm.Provider
+		switch c.Format {
+		case llm.FormatAnthropic:
+			provider, err = subscription.NewClaudeProvider(auth, config)
+		case llm.FormatOpenAIResponses:
+			provider, err = subscription.NewCodexProvider(auth, config)
+		default:
+			return nil, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "native LLM profile format is incompatible with its provider"}
+		}
+		if err != nil {
+			return nil, err
+		}
+		return llm.RateLimited(provider, llm.RateLimit{
+			PerSecond: c.RatePerSecond,
+			PerMinute: c.RatePerMinute,
+		}), nil
+	}
+	if authMode != "api_key" {
+		return nil, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "unsupported LLM authentication mode"}
+	}
+
 	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.UserAgent)
 	if err != nil {
 		return nil, err
@@ -595,10 +667,10 @@ func clipBody(s string) string {
 }
 
 // TestConnection makes a minimal real completion to verify the provider/model/
-// endpoint/key actually work. Returns the round-trip latency and the model's
-// reply text.
-func TestConnection(ctx context.Context, c Config) (time.Duration, string, error) {
-	prov, err := c.NewProvider()
+// endpoint/key or selected native credential actually works. Returns the
+// round-trip latency and the model's reply text.
+func TestConnection(ctx context.Context, c Config, auth *subscription.Manager) (time.Duration, string, error) {
+	prov, err := c.NewProvider(auth)
 	if err != nil {
 		return 0, "", err
 	}

@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
-	actool "github.com/Autumn-27/norma/tool"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 // normalizeFactSource: empty is inference, every enum value is kept, case and

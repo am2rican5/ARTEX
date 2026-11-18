@@ -12,8 +12,8 @@ import (
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 	"github.com/Autumn-27/artex/traffic"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 // The gate wired into the server: the exemption API, the exemptions derived

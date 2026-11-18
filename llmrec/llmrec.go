@@ -12,18 +12,25 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/transcript"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/transcript"
+	"github.com/Autumn-27/artex/subscription"
 )
 
 type taskIDContextKey struct{}
 type workerContextKey struct{}
 
-// WithTaskID attaches the owning task registry id to an LLM call. Session ids
+// WithTaskID attaches the owning task registry id to an LLM call. A blank id is
+// a no-op so optional nested annotations retain their parent task. Session ids
 // are based on exploration ids, which are not interchangeable with task ids.
 func WithTaskID(ctx context.Context, taskID string) context.Context {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
+		return ctx
+	}
+	ctx = subscription.WithTaskScope(ctx, taskID)
+	current, _ := ctx.Value(taskIDContextKey{}).(string)
+	if current == taskID {
 		return ctx
 	}
 	return context.WithValue(ctx, taskIDContextKey{}, taskID)
@@ -148,8 +155,8 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 	// Serialize the request only when storing bodies (this is the expensive part).
 	// Alongside it, attach a Capture so the HTTP transport can hand back the
 	// untouched wire bodies — the normalized view below cannot reconstruct them
-	// (tool schemas are dropped, tool_use blocks never reach this layer, and the
-	// SSE framing is already decoded). See capture.go.
+	// (tool schemas are dropped and the SSE framing is already decoded). See
+	// capture.go.
 	reqBody := ""
 	var capt *Capture
 	if recordBodies {
@@ -159,12 +166,15 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 
 	return func(yield func(llm.StreamEvent, error) bool) {
 		var (
-			textBuf     strings.Builder
-			thinkingBuf strings.Builder
-			usage       llm.Usage
-			stopReason  string
-			streamErr   error
+			usage      llm.Usage
+			stopReason string
+			streamErr  error
+			acc        *llm.Accumulator
+			completed  bool
 		)
+		if recordBodies {
+			acc = llm.NewAccumulator()
+		}
 
 		finished := false
 		finish := func(err error) {
@@ -172,6 +182,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				return
 			}
 			finished = true
+			complete := completed && err == nil && ctx.Err() == nil
 			status := "ok"
 			if err != nil {
 				status = "error"
@@ -180,7 +191,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 			r.recordUsage(ctx, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
 			// Heavy trace row — only when body recording is on.
 			if recordBodies {
-				r.record(req, session, taskID, worker, reqBody, capt, start, textBuf.String(), thinkingBuf.String(), usage, stopReason, err)
+				r.record(session, taskID, worker, reqBody, capt, start, acc.Message(), usage, stopReason, complete, err)
 			}
 		}
 		defer func() { finish(ctx.Err()) }()
@@ -194,21 +205,15 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				}
 				return
 			}
-			// Always track usage (cheap); accumulate text/thinking only for bodies.
-			// message_start carries the input side (input + cache) and is added.
-			// Since Norma v0.4.7 message_delta also echoes that input side next to the
-			// output, so it is folded with llm.Usage.MergeEcho (max on echoed fields,
-			// sum on output), as llm.Accumulator does; Add would count the input and
-			// cache twice. An output-only delta folds the same either way.
+			if acc != nil {
+				acc.Add(ev)
+			}
+			// Always track usage (cheap). message_start carries the input side
+			// (input + cache) and is added. Since Norma v0.4.7 message_delta also
+			// echoes that input side next to the output, it is folded with
+			// llm.Usage.MergeEcho (max on echoed fields, sum on output); Add would
+			// count the input and cache twice.
 			switch ev.Type {
-			case llm.SETextDelta:
-				if recordBodies {
-					textBuf.WriteString(ev.Text)
-				}
-			case llm.SEThinkingDelta:
-				if recordBodies {
-					thinkingBuf.WriteString(ev.Text)
-				}
 			case llm.SEMessageStart:
 				usage.Add(ev.Usage)
 			case llm.SEMessageDelta:
@@ -216,13 +221,16 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 					stopReason = ev.StopReason
 				}
 				usage.MergeEcho(ev.Usage)
+			case llm.SEMessageStop:
+				completed = true
 			}
 			if !yield(ev, err) {
 				return
 			}
 		}
 
-		// Stream completed normally.
+		// A stream is complete only when its provider emitted its terminal event.
+		// A clean iterator return without that event is retained as a partial trace.
 		finish(streamErr)
 	}
 }
@@ -255,9 +263,10 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	if err != nil {
 		status = "error"
 	}
+	completed := err == nil && ctx.Err() == nil
 	r.recordUsage(ctx, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
 	if recordBodies {
-		r.record(req, session, taskID, worker, reqBody, capt, start, msg.Text(), thinkingText(msg), usage, stopReason, err)
+		r.record(session, taskID, worker, reqBody, capt, start, msg, usage, stopReason, completed, err)
 	}
 	return msg, stopReason, usage, err
 }
@@ -270,6 +279,26 @@ func thinkingText(msg llm.Message) string {
 		}
 	}
 	return b.String()
+}
+
+func serializeResponse(msg llm.Message, usage llm.Usage, stopReason string, completed bool) string {
+	resp := map[string]any{
+		"text":        msg.Text(),
+		"message":     msg,
+		"completed":   completed,
+		"stop_reason": stopReason,
+		"usage": map[string]int{
+			"input_tokens":       usage.InputTokens,
+			"output_tokens":      usage.OutputTokens,
+			"cache_read_tokens":  usage.CacheReadTokens,
+			"cache_write_tokens": usage.CacheWriteTokens,
+		},
+	}
+	if thinking := thinkingText(msg); thinking != "" {
+		resp["thinking"] = thinking
+	}
+	b, _ := json.Marshal(resp)
+	return string(b)
 }
 
 // recordUsage appends one lightweight metering row to llm_usage (no bodies). Skips
@@ -308,7 +337,7 @@ func (r *Recorder) recordUsage(ctx context.Context, taskID string, expID int64, 
 // record persists one LLM call to PostgreSQL before the provider stream returns.
 // Keeping the write inside the owning task operation means task deletion can
 // drain calls and then remove records without a late async insert recreating one.
-func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, reqBody string, capt *Capture, start time.Time, text, thinking string, usage llm.Usage, stopReason string, streamErr error) {
+func (r *Recorder) record(session, taskID, worker, reqBody string, capt *Capture, start time.Time, msg llm.Message, usage llm.Usage, stopReason string, completed bool, streamErr error) {
 	latency := int(time.Since(start).Milliseconds())
 	status := "ok"
 	errMsg := ""
@@ -316,34 +345,18 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 		status = "error"
 		errMsg = streamErr.Error()
 	}
-
-	// Build response body JSON.
-	resp := map[string]any{
-		"text":        text,
-		"stop_reason": stopReason,
-		"usage": map[string]int{
-			"input_tokens":       usage.InputTokens,
-			"output_tokens":      usage.OutputTokens,
-			"cache_read_tokens":  usage.CacheReadTokens,
-			"cache_write_tokens": usage.CacheWriteTokens,
-		},
-	}
-	if thinking != "" {
-		resp["thinking"] = thinking
-	}
-	respBody, _ := json.Marshal(resp)
-
-	model := ""
-	if len(req.System) > 0 {
-		// model is not in CompletionRequest; use the configured model name
-	}
-	model = r.model
+	// Keep the historical text/thinking fields for readers, and retain the
+	// structured assistant message so opaque native replay state and tool calls
+	// remain attached to the exact content that produced them. completed reflects
+	// the provider's real terminal checkpoint; a partial/error stream never gets
+	// upgraded merely because its iterator returned.
+	respBody := serializeResponse(msg, usage, stopReason, completed)
 
 	rec := &db.LLMRecord{
 		SessionID:    session,
 		TaskID:       taskID,
 		Worker:       worker,
-		Model:        model,
+		Model:        r.model,
 		ProfileName:  r.prof,
 		LatencyMs:    latency,
 		InputTokens:  usage.InputTokens,
@@ -353,7 +366,7 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 		Status:       status,
 		Error:        errMsg,
 		RequestBody:  reqBody,
-		ResponseBody: string(respBody),
+		ResponseBody: respBody,
 		// Raw wire bodies; empty when the transport did not fill the Capture
 		// (e.g. a provider dialing through a client without the capture hook, or
 		// a call that failed before any HTTP request went out).

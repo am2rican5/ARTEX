@@ -51,6 +51,9 @@ func (e *Engine) inflightCounter(taskID string) *int64 {
 func (e *Engine) beginTaskOperation(taskID string) bool {
 	e.deleteMu.RLock()
 	defer e.deleteMu.RUnlock()
+	if e.draining.Load() {
+		return false
+	}
 	if e.IsDeleting(taskID) {
 		return false
 	}
@@ -147,10 +150,14 @@ func (e *Engine) clockCtx(base context.Context, t *Task, final bool) context.Con
 // Called from Run() and from the restart reload path, so non-active timeout tasks
 // still get settled after their deadline even without live planner/worker loops.
 func (e *Engine) startDeadlineCoordinator(ctx context.Context, t *Task) {
-	if t == nil || t.TimeoutSeconds <= 0 {
+	if t == nil || t.TimeoutSeconds <= 0 || e.draining.Load() {
 		return
 	}
 	e.deleteMu.RLock()
+	if e.draining.Load() {
+		e.deleteMu.RUnlock()
+		return
+	}
 	if e.IsDeleting(t.ID) {
 		e.deleteMu.RUnlock()
 		return
@@ -202,6 +209,9 @@ func (e *Engine) deadlineCoordinator(ctx context.Context, t *Task) {
 // task run budget is exhausted (budget.go) instead of the deadline: same sequence,
 // the final round carries the budget wrap-up words.
 func (e *Engine) settleTask(ctx context.Context, t *Task, budget bool) {
+	if err := e.guardNativeRecovery(ctx, t); err != nil {
+		return
+	}
 	if !e.markSettling(t.ID) {
 		return
 	}
@@ -226,13 +236,22 @@ func (e *Engine) settleTask(ctx context.Context, t *Task, budget bool) {
 			return // whole engine shutting down
 		}
 	}
+	if err := e.guardNativeRecovery(ctx, t); err != nil {
+		return
+	}
 
 	// ⑤ one final planner round (task-timeout words, final goal judgment, no new intents).
-	met := e.runFinalPlannerRound(ctx, t, budget)
+	met, err := e.runFinalPlannerRound(ctx, t, budget)
+	if err != nil {
+		return
+	}
 	if !e.beginTaskOperation(t.ID) {
 		return
 	}
 	defer e.decInflight(t.ID)
+	if err := e.guardNativeRecovery(ctx, t); err != nil {
+		return
+	}
 
 	// ⑥ set the terminal state (guarded): met → done (completed); otherwise timeout. If the
 	// normal path already settled done first, the guard (SetTaskStatusGuarded) rejects the
@@ -264,22 +283,28 @@ func (e *Engine) settleTask(ctx context.Context, t *Task, budget bool) {
 // runFinalPlannerRound drives exactly ONE terminal planner round with the
 // task-timeout planner words (final goal judgment; no new intents). Waits for the
 // LLM to be ready (bounded by ctx) so a completable task isn't mis-judged timeout.
-func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, budget bool) (met bool) {
+func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, budget bool) (met bool, recoveryErr error) {
 	if e.IsDeleting(t.ID) {
-		return false
+		return false, nil
+	}
+	if err := e.guardNativeRecovery(ctx, t); err != nil {
+		return false, err
 	}
 	planner, _ := e.snapshotFor(t)
 	for planner == nil {
 		if sleepCtx(ctx, deadlinePollInterval) {
-			return false
+			return false, nil
 		}
 		if isTerminalStatus(e.m.TaskStatus(t.ID)) {
-			return false
+			return false, nil
 		}
 		if e.IsDeleting(t.ID) {
-			return false
+			return false, nil
 		}
 		planner, _ = e.snapshotFor(t)
+	}
+	if err := e.guardNativeRecovery(ctx, t); err != nil {
+		return false, err
 	}
 	// Independent ctx (not wired to execCancel, so a pause/hard cancel cannot interrupt this
 	// final round), with Final injecting the task-timeout words.
@@ -290,7 +315,7 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, budget bool)
 		label = "task budget settle"
 	}
 	if !e.beginTaskOperation(t.ID) {
-		return false
+		return false, nil
 	}
 	defer e.decInflight(t.ID)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
@@ -299,13 +324,20 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, budget bool)
 	tTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	// The final round judges, it does not explore: a gated call never waits here.
 	fctx = e.plannerGateContext(fctx, t, 0)
+	if err := e.guardNativeRecovery(fctx, t); err != nil {
+		return false, err
+	}
 	e.BeginLLMCall(t.ID)
 	met, reason, err := planner.Plan(fctx, tTaskID, e.m.assets, t.Store, t.Goal, t.drainTriggers(), t.TargetGuard.Hooks(), emit)
 	e.EndLLMCall(t.ID)
+	if e.holdNativeTaskAfterTerminalError(fctx, t, err) {
+		log.Printf("[deadline] task %s paused after terminal native final-planning error; explicit Resume is required", t.ID)
+		return false, err
+	}
 	if err != nil {
 		log.Printf("[deadline] task %s final planning error: %v", t.ID, err)
 	} else if met {
 		log.Printf("[deadline] task %s final judgment: goal met: %s", t.ID, reason)
 	}
-	return met
+	return met, nil
 }

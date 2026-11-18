@@ -14,8 +14,8 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/norma/harness"
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/harness"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -76,13 +76,15 @@ const (
 
 var errWorkControlConflict = errors.New("work control conflict")
 
-// retryableWorkerModelError excludes errors already handled by the task router.
-// In particular, a quota error after partial streaming advances the task cursor
-// for the next LLM call but must not replay this whole intent on the backup.
-// A NOA budget refusal is deterministic and never reached the provider, so a
-// rerun would only fail the same way.
+// retryableWorkerModelError excludes errors already handled by the task router
+// and every terminal native error, including wrapped compactor/provider errors
+// that reach the worker without a taskLLMError wrapper. A quota error after
+// partial streaming advances the task cursor for the next LLM call but must not
+// replay this whole intent on the backup. A NOA budget refusal is deterministic
+// and never reached the provider, so a rerun would only fail the same way.
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !errors.Is(err, agent.ErrNoaBudget)
+	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) &&
+		!(autoRetryDisabled(err) && autoFallbackDisabled(err)) && !errors.Is(err, agent.ErrNoaBudget)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -98,9 +100,10 @@ type Engine struct {
 
 	bc *Broadcaster // live activity pub/sub (SSE)
 
-	started  sync.Map // taskID -> bool, so Run is idempotent per task
-	lastAct  sync.Map // taskID -> int64 unix, last planner/worker activity (heartbeat)
-	llmCalls sync.Map // taskID -> *int64, actual planner/worker/main-agent LLM calls
+	started  sync.Map    // taskID -> bool, so Run is idempotent per task
+	draining atomic.Bool // shutdown barrier: no new task routines or writes after the drain snapshot
+	lastAct  sync.Map    // taskID -> int64 unix, last planner/worker activity (heartbeat)
+	llmCalls sync.Map    // taskID -> *int64, actual planner/worker/main-agent LLM calls
 	// quiet-mode (#79): open-goal fingerprint recorded at the end of the last
 	// completed planning round, per task. Edge-triggered rounds are skipped
 	// while it is unchanged and work is still in flight.
@@ -316,6 +319,9 @@ func (e *Engine) Resume(t *Task) {
 	// resume must never clear it and let a planner/worker re-enter while cleanup
 	// is waiting for task operations to drain.
 	if t == nil {
+		return
+	}
+	if nativeRecoveryBarrierSet(t) {
 		return
 	}
 	e.deleteMu.RLock()
@@ -749,8 +755,19 @@ func (e *Engine) ReadyFor(t *Task) bool {
 // but no-op until an LLM is configured (so a task created while idle picks up
 // automatically once LLM is set from the UI).
 func (e *Engine) Run(ctx context.Context, t *Task) {
+	if e == nil || t == nil || ctx == nil || ctx.Err() != nil || e.draining.Load() {
+		return
+	}
+	if nativeRecoveryBarrierSet(t) {
+		_ = e.applyNativeRecoveryBarrier(t, false)
+		return
+	}
 	workers := e.m.Workers()
 	e.deleteMu.RLock()
+	if e.draining.Load() {
+		e.deleteMu.RUnlock()
+		return
+	}
 	if e.IsDeleting(t.ID) {
 		e.deleteMu.RUnlock()
 		return
@@ -929,6 +946,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		e.BeginLLMCall(t.ID)
 		met, reason, err := planner.Plan(pctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, t.TargetGuard.Hooks(), emit)
 		e.EndLLMCall(t.ID)
+		if e.holdNativeTaskAfterTerminalError(pctx, t, err) {
+			log.Printf("[planner] task %s paused after terminal native model error; explicit Resume is required", t.ID)
+			return
+		}
 		switch {
 		case err != nil && ectx.Err() == nil:
 			log.Printf("[planner] task %s planning error: %v", t.ID, err)
@@ -988,13 +1009,25 @@ func (e *Engine) claimSweepLoop(ctx context.Context, t *Task) {
 		if !e.beginTaskOperation(t.ID) {
 			return
 		}
-		n, err := t.Store.ResetRunningIntents()
+		e.sweepExpiredClaims(t)
 		e.decInflight(t.ID)
-		if err != nil {
-			log.Printf("[engine] task %s expired-claim sweep failed: %v", t.ID, err)
-		} else if n > 0 {
-			log.Printf("[engine] task %s returned %d expired intent claims to open", t.ID, n)
+	}
+}
+
+func (e *Engine) sweepExpiredClaims(t *Task) {
+	n, err := t.Store.ResetRunningIntents()
+	if errors.Is(err, db.ErrNativeRecoveryHeld) {
+		if warningErr := e.applyNativeRecoveryBarrier(t, true); warningErr != nil {
+			log.Printf("[native-recovery] task %s held after %d expired claims, but warning persistence failed: %v", t.ID, n, warningErr)
+		} else {
+			log.Printf("[native-recovery] task %s held after %d expired native intent claims; manual Resume is required", t.ID, n)
 		}
+		return
+	}
+	if err != nil {
+		log.Printf("[engine] task %s expired-claim sweep failed: %v", t.ID, err)
+	} else if n > 0 {
+		log.Printf("[engine] task %s returned %d expired intent claims to open", t.ID, n)
 	}
 }
 
@@ -1181,6 +1214,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
 		}
 		e.EndLLMCall(t.ID)
+	}
+	if e.holdNativeTaskAfterTerminalError(workCtx, t, err) {
+		log.Printf("[worker %s] task %s intent #%d paused after terminal native model error; explicit Resume is required",
+			name, t.ID, intent.ID)
 	}
 	stopHeartbeat() // no longer busy: the state writes below follow within the just-renewed claim
 	if meter != nil {

@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 func replayFixture(history []Exchange, memory *Memory) Replay {
@@ -102,11 +102,22 @@ func TestSideLongExchangeAndSnapshotCompactionAreBounded(t *testing.T) {
 	for _, hugeHistory := range []bool{true, false} {
 		t.Run(fmt.Sprint(hugeHistory), func(t *testing.T) {
 			snap := Snapshot{Request: fixture(), Model: Model{WindowTokens: 32000}}
+			snap.Request.Messages[2].ProviderState = &llm.ProviderState{
+				Provider: "openai-codex-oauth", Model: "codex-native", AuthScope: "account:workspace",
+				Data: []byte(`{"opaque":"retained-native-state"}`),
+			}
 			var history []Exchange
 			if hugeHistory {
 				history = []Exchange{{Ordinal: 1, Question: "earlier", Answer: strings.Repeat("historical evidence ABC ", 14000), Status: "completed"}}
 			} else {
-				snap.Request.Messages = append([]llm.Message{llm.UserText(strings.Repeat("old tool evidence text ", 9000))}, snap.Request.Messages...)
+				snap.Request.Messages = append([]llm.Message{{
+					Role:    llm.RoleAssistant,
+					Content: []llm.ContentBlock{llm.TextBlock(strings.Repeat("old tool evidence text ", 9000))},
+					ProviderState: &llm.ProviderState{
+						Provider: "openai-codex-oauth", Model: "codex-native", AuthScope: "account:workspace",
+						Data: []byte(`{"opaque":"opaque-native-state-must-not-cross-summary"}`),
+					},
+				}}, snap.Request.Messages...)
 			}
 			original := mustJSON(t, snap)
 			calls, answers := 0, 0
@@ -116,6 +127,9 @@ func TestSideLongExchangeAndSnapshotCompactionAreBounded(t *testing.T) {
 					calls++
 					if len(r.Tools) != 0 || EstimateInputTokens(r)+r.MaxTokens > 32000 || !utf8.ValidString(r.Messages[0].Text()) {
 						t.Fatal("unsafe summary request")
+					}
+					if strings.Contains(r.Messages[0].Text(), "opaque-native-state") {
+						t.Fatal("provider state was converted into visible summary material")
 					}
 					return assistant("goal, evidence and unresolved questions"), "end_turn", llm.Usage{OutputTokens: 3}, nil
 				}
@@ -136,6 +150,12 @@ func TestSideLongExchangeAndSnapshotCompactionAreBounded(t *testing.T) {
 			}
 			if !strings.Contains(string(mustJSON(t, final)), "verified asset") {
 				t.Fatal("recent tool evidence discarded")
+			}
+			if strings.Contains(string(mustJSON(t, final)), "opaque-native-state") {
+				t.Fatal("summarized provider state crossed the compaction boundary")
+			}
+			if !strings.Contains(string(mustJSON(t, final)), "retained-native-state") {
+				t.Fatal("intact retained turn lost provider state")
 			}
 			if string(original) != string(mustJSON(t, snap)) {
 				t.Fatal("main snapshot modified")

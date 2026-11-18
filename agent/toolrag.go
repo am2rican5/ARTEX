@@ -11,7 +11,7 @@ import (
 	"strings"
 	"unicode"
 
-	actool "github.com/Autumn-27/norma/tool"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 // Tool RAG: a lexical PROJECTION of an agent's already-bound tool list. It runs in

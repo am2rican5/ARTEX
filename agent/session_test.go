@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/transcript"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/transcript"
 )
 
 // sessionProbe is a provider that answers every call with one text turn and

@@ -119,11 +119,11 @@ func readApplied(t *testing.T, d *DB) []appliedMigration {
 	return out
 }
 
-// assertEmbeddedApplied checks that both LLM tables exist and that every
-// embedded migration is recorded with the SHA-256 of its file.
+// assertEmbeddedApplied checks that the migrated LLM tables exist and that
+// every embedded migration is recorded with the SHA-256 of its file.
 func assertEmbeddedApplied(t *testing.T, d *DB) []appliedMigration {
 	t.Helper()
-	for _, table := range []string{"llm_records", "llm_usage"} {
+	for _, table := range []string{"llm_records", "llm_usage", "llm_credentials"} {
 		var exists bool
 		if err := d.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
 			t.Fatal(err)
@@ -137,9 +137,9 @@ func assertEmbeddedApplied(t *testing.T, d *DB) []appliedMigration {
 		version int
 		name    string
 	}{{1, llmRecordsMigration}, {2, llmUsageMigration}, {3, "0003_task_scope_icp_index.sql"}, {4, "0004_llm_usage_ts_index.sql"},
-		{5, "0005_traffic_rewrite_rules.sql"}}
+		{5, "0005_traffic_rewrite_rules.sql"}, {6, "0006_llm_oauth_credentials.sql"}, {7, "0007_native_task_recovery.sql"}}
 	if len(applied) != len(want) {
-		t.Fatalf("schema_migrations = %+v, want versions 1 to 5", applied)
+		t.Fatalf("schema_migrations = %+v, want versions 1 to 7", applied)
 	}
 	for i, w := range want {
 		content, err := fs.ReadFile(migrationsFS(), w.name)
@@ -255,6 +255,70 @@ func TestOpenAdoptsExistingTablesWithoutSchemaMigrations(t *testing.T) {
 	}
 	d.Close()
 	assertReopenIsNoop(t, dsn, applied)
+}
+
+func TestOAuthCredentialMigrationUpgradesExistingProfilesIdempotently(t *testing.T) {
+	dsn := scratchDSN(t, "oauth_existing")
+	if err := ensureDatabase(dsn); err != nil {
+		t.Fatalf("create scratch database: %v", err)
+	}
+	raw, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	_, err = raw.Exec(`
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END;
+$$ LANGUAGE plpgsql;
+CREATE TABLE llm_profiles (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    format TEXT NOT NULL,
+    model TEXT NOT NULL,
+    api_key TEXT
+);
+INSERT INTO llm_profiles(name,format,model,api_key)
+VALUES ('legacy-key','openai','legacy-model','legacy-secret');
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration, err := fs.ReadFile(migrationsFS(), "0006_llm_oauth_credentials.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for pass := 1; pass <= 2; pass++ {
+		if _, err := raw.Exec(string(migration)); err != nil {
+			t.Fatalf("migration pass %d: %v", pass, err)
+		}
+	}
+	var (
+		mode       string
+		credential sql.NullInt64
+		generation int64
+		key        string
+	)
+	if err := raw.QueryRow(`SELECT auth_mode,credential_id,auth_binding_generation,api_key
+FROM llm_profiles WHERE name='legacy-key'`).Scan(&mode, &credential, &generation, &key); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "api_key" || credential.Valid || generation != 0 || key != "legacy-secret" {
+		t.Fatalf("legacy profile changed: mode=%q credential=%v generation=%d key=%q", mode, credential, generation, key)
+	}
+
+	var credentialID int64
+	if err := raw.QueryRow(`INSERT INTO llm_credentials(provider,label,payload)
+VALUES ('anthropic-oauth','migration fixture','{}') RETURNING id`).Scan(&credentialID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO llm_profiles(name,format,model,auth_mode,credential_id)
+VALUES ('oauth-profile','anthropic','claude-test','oauth',$1)`, credentialID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`DELETE FROM llm_credentials WHERE id=$1`, credentialID); err == nil {
+		t.Fatal("referenced credential deletion succeeded; want ON DELETE RESTRICT")
+	}
 }
 
 // probeMigration records how many migrations were already applied when it

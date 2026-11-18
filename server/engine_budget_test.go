@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 // With the budget env vars unset the engine decides exactly as before (no round

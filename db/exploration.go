@@ -333,40 +333,85 @@ func (s *ExplorationStore) DeleteGoal(id int64) error {
 	return nil
 }
 
-// SetIntentState updates an intent node's state.
-// ResetRunningIntents returns any intent left in 'running' back to 'open' so it
-// is re-claimed. Called on startup: a 'running' intent with no live worker (a
-// backend restart or crashed worker goroutine left it stuck) would otherwise spin
-// forever in the UI. Workers resume from their transcript, so reopening is safe.
+// ResetRunningIntents recovers expired intent claims without disturbing a live
+// worker. Ordinary claims return to open. A task that has used native execution
+// instead gets a durable recovery hold and its expired claims become blocked:
+// their external outcome may have committed before the process lost it.
 //
-// Only an expired claim is taken over: last_heartbeat_at older than
-// IntentClaimTTL, or NULL (a legacy row claimed before the lease columns
-// existed, whose claimer never heartbeats). A live claim — including one held by
-// another instance on the same database — is left alone. The expiry check and
-// the takeover are one atomic UPDATE on the database clock, and clearing
-// unclaim_token fences the previous claimer out. The engine also calls this
-// periodically, so a claim that was still live at startup is taken over once it
-// expires.
+// The public signature and 90-second lease predicate are retained. After a
+// native hold commits, the affected count is returned with
+// ErrNativeRecoveryHeld so periodic callers can stop automatic task execution.
 func (s *ExplorationStore) ResetRunningIntents() (int64, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL, unclaim_token=NULL
-WHERE exploration_id=$1 AND kind='intent' AND state='running'
-  AND (last_heartbeat_at IS NULL OR last_heartbeat_at < now() - $2 * INTERVAL '1 second')`, s.expID, IntentClaimTTL.Seconds())
+	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
+	defer tx.Rollback()
+
+	var taskID int64
+	var nativeUsed, recoveryHeld bool
+	err = tx.QueryRow(`SELECT id, native_used, native_recovery_hold
+FROM tasks WHERE exploration_id=$1 AND deleted_at IS NULL FOR UPDATE`, s.expID).
+		Scan(&taskID, &nativeUsed, &recoveryHeld)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	hasRecoveryBarrier := err == nil && (nativeUsed || recoveryHeld)
+
+	state := "open"
+	if hasRecoveryBarrier {
+		state = "blocked"
+	}
+	res, err := tx.Exec(`UPDATE exploration_nodes
+SET state=$3,
+    completed_at=CASE WHEN $3='blocked' THEN now() ELSE NULL END,
+    blocked_reason=CASE WHEN $3='blocked' THEN 'native_outcome_unknown' ELSE NULL END,
+    unclaim_token=NULL
+WHERE exploration_id=$1 AND kind='intent' AND state='running'
+  AND (last_heartbeat_at IS NULL OR last_heartbeat_at < now() - $2 * INTERVAL '1 second')`,
+		s.expID, IntentClaimTTL.Seconds(), state)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 && hasRecoveryBarrier {
+		_, err = tx.Exec(`UPDATE tasks
+SET native_recovery_hold=true,
+    paused=CASE WHEN status IN ('done','failed','timeout') THEN paused ELSE true END,
+    queued=CASE WHEN status IN ('done','failed','timeout') THEN queued ELSE false END,
+    queued_at=CASE WHEN status IN ('done','failed','timeout') THEN queued_at ELSE NULL END,
+    paused_at=CASE
+        WHEN status IN ('done','failed','timeout') THEN paused_at
+        ELSE COALESCE(paused_at, now())
+    END
+WHERE id=$1`, taskID)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	if n > 0 && hasRecoveryBarrier {
+		return n, ErrNativeRecoveryHeld
+	}
 	return n, nil
 }
 
 // ReopenIntent flips ONE not-successfully-finished intent (blocked/exhausted/stopped)
 // back to 'open' so a worker re-claims it (graph writes it already produced stay).
-// The worker resumes from its prior LLM transcript instead of restarting from scratch.
+// An uncertain native outcome is reopened only by the task admission
+// acknowledgement transaction.
 // done/open/running are left untouched. Returns whether a row changed. Used by "rerun".
 func (s *ExplorationStore) ReopenIntent(id int64) (bool, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes
 SET state='open', completed_at=NULL, blocked_reason=NULL
 WHERE id=$1 AND exploration_id=$2 AND kind='intent'
-  AND state IN ('blocked','exhausted','stopped')`, id, s.expID)
+  AND state IN ('blocked','exhausted','stopped')
+  AND COALESCE(blocked_reason,'') <> 'native_outcome_unknown'`, id, s.expID)
 	if err != nil {
 		return false, err
 	}
@@ -374,12 +419,13 @@ WHERE id=$1 AND exploration_id=$2 AND kind='intent'
 	return n > 0, nil
 }
 
-// ReopenBlockedIntents flips EVERY 'blocked' intent in this exploration back to 'open'
-// (batch rerun after e.g. an LLM/network outage that blocked many at once). Returns the
-// number reopened. Workers resume from their transcripts; kept graph writes remain.
+// ReopenBlockedIntents flips retryable blocked intents in this exploration back
+// to open. Native-outcome holds are excluded: only explicit task admission
+// acknowledgement may reopen them. Returns the number reopened.
 func (s *ExplorationStore) ReopenBlockedIntents() (int64, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL
-WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
+WHERE exploration_id=$1 AND kind='intent' AND state='blocked'
+  AND COALESCE(blocked_reason,'') <> 'native_outcome_unknown'`, s.expID)
 	if err != nil {
 		return 0, err
 	}

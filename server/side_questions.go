@@ -17,10 +17,10 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/transcript"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/sidequestion"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/transcript"
 )
 
 type sideRun struct {
@@ -41,9 +41,18 @@ type sideQuestionState struct {
 }
 
 func sideModel(cfg agent.Config, id int64, name string) sidequestion.Model {
-	b, _ := json.Marshal([]any{cfg.Format, cfg.BaseURL, cfg.Model, cfg.ThinkingType, cfg.ReasoningEffort, cfg.Stream, cfg.MaxTokensField, cfg.SessionHeaderKey, cfg.UserAgent})
+	identity := []any{cfg.Format, cfg.BaseURL, cfg.Model, cfg.ThinkingType, cfg.ReasoningEffort, cfg.Stream, cfg.MaxTokensField, cfg.SessionHeaderKey, cfg.UserAgent}
+	model := sidequestion.Model{ProfileID: id, Name: name, Format: string(cfg.Format), Model: cfg.Model, Streaming: cfg.Stream, WindowTokens: cfg.CompactionWindow()}
+	if cfg.AuthMode == "oauth" {
+		identity = append(identity, cfg.AuthMode, cfg.CredentialID, cfg.AuthBindingGeneration)
+		model.AuthMode = cfg.AuthMode
+		model.CredentialID = cfg.CredentialID
+		model.AuthBindingGeneration = cfg.AuthBindingGeneration
+	}
+	b, _ := json.Marshal(identity)
 	h := sha256.Sum256(b)
-	return sidequestion.Model{ProfileID: id, Name: name, Format: string(cfg.Format), Model: cfg.Model, Identity: hex.EncodeToString(h[:]), Streaming: cfg.Stream, WindowTokens: cfg.CompactionWindow()}
+	model.Identity = hex.EncodeToString(h[:])
+	return model
 }
 
 func bindSideProvider(p llm.Provider, cfg agent.Config, id int64, name string) llm.Provider {
@@ -192,7 +201,15 @@ func (s *Server) sideProvider(model sidequestion.Model) (llm.Provider, error) {
 	if model.ProfileID > 0 {
 		// Validate the persisted reference even if a previous provider is cached.
 		current, exists := s.loadProfileConfig(model.ProfileID)
-		if !exists || sideModel(current, model.ProfileID, model.Name).Identity != model.Identity {
+		if !exists {
+			return nil, errors.New("the model profile was deleted or changed; run the main Agent first to refresh the context")
+		}
+		if sideModel(current, model.ProfileID, model.Name).Identity != model.Identity {
+			if model.AuthMode == "oauth" {
+				if err := s.nativeProfileSelectionError(model.ProfileID); err != nil {
+					return nil, err
+				}
+			}
 			return nil, errors.New("the model profile was deleted or changed; run the main Agent first to refresh the context")
 		}
 		p, cfg, ok = s.providerForProfile(model.ProfileID)
@@ -202,6 +219,11 @@ func (s *Server) sideProvider(model sidequestion.Model) (llm.Provider, error) {
 		s.cfgMu.Unlock()
 	}
 	if !ok || p == nil || sideModel(cfg, model.ProfileID, model.Name).Identity != model.Identity {
+		if model.AuthMode == "oauth" {
+			if err := s.nativeProfileSelectionError(model.ProfileID); err != nil {
+				return nil, err
+			}
+		}
 		return nil, errors.New("the model profile was deleted or changed; run the main Agent first to refresh the context")
 	}
 	return p, nil

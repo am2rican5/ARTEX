@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	actool "github.com/Autumn-27/norma/tool"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
 )
 
 // Server wiring installs the hooks while restored tasks may already be assembling

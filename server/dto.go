@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/subscription"
 	"github.com/Autumn-27/artex/traffic"
 )
 
@@ -603,23 +604,78 @@ func agentDTOs(in []*db.Agent) []AgentDTO {
 	return out
 }
 
+// ---- Native subscription credentials ----
+
+type CredentialDTO struct {
+	ID        int64  `json:"id"`
+	Provider  string `json:"provider"`
+	Label     string `json:"label"`
+	Status    string `json:"status"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+func credentialDTO(c db.LLMCredential) CredentialDTO {
+	return CredentialDTO{
+		ID:        c.ID,
+		Provider:  c.Provider,
+		Label:     c.Label,
+		Status:    c.Status,
+		CreatedAt: c.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt: c.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+type AttemptDTO struct {
+	ID               string `json:"id"`
+	Provider         string `json:"provider"`
+	Status           string `json:"status"`
+	AuthorizationURL string `json:"authorization_url,omitempty"`
+	CallbackURL      string `json:"callback_url,omitempty"`
+	CredentialID     *int64 `json:"credential_id,omitempty"`
+	ExpiresAt        string `json:"expires_at"`
+	Error            string `json:"error,omitempty"`
+}
+
+func attemptDTO(a subscription.Attempt) AttemptDTO {
+	dto := AttemptDTO{
+		ID:        a.ID,
+		Provider:  a.Provider,
+		Status:    a.Status,
+		ExpiresAt: a.ExpiresAt.UTC().Format(time.RFC3339),
+		Error:     a.Error,
+	}
+	if a.Status == subscription.AttemptPending {
+		dto.AuthorizationURL = a.AuthorizationURL
+		dto.CallbackURL = a.CallbackURL
+	}
+	if a.CredentialID > 0 {
+		id := a.CredentialID
+		dto.CredentialID = &id
+	}
+	return dto
+}
+
 // ---- LLMProfile (frontend "LLMProfile") — string id ----
 
 type LLMProfileDTO struct {
-	ID              string  `json:"id"`
-	Name            string  `json:"name"`
-	Format          string  `json:"format"`
-	BaseURL         string  `json:"base_url,omitempty"`
-	Proxy           string  `json:"proxy,omitempty"` // masked: the placeholder when set
-	ProxySet        bool    `json:"proxy_set"`
-	Model           string  `json:"model"`
-	APIKeyHint      string  `json:"api_key_hint,omitempty"`
-	RatePerSecond   float64 `json:"rate_per_second"`
-	RatePerMinute   float64 `json:"rate_per_minute"`
-	ContextWindowK  int     `json:"context_window_k"`
-	ThinkingType    string  `json:"thinking_type"`
-	ReasoningEffort string  `json:"reasoning_effort"`
-	IsDefault       bool    `json:"is_default"`
+	ID                    string  `json:"id"`
+	Name                  string  `json:"name"`
+	Format                string  `json:"format"`
+	BaseURL               string  `json:"base_url,omitempty"`
+	Proxy                 string  `json:"proxy,omitempty"` // masked: the placeholder when set
+	ProxySet              bool    `json:"proxy_set"`
+	Model                 string  `json:"model"`
+	APIKeyHint            string  `json:"api_key_hint,omitempty"`
+	AuthMode              string  `json:"auth_mode"`
+	CredentialID          *int64  `json:"credential_id"`
+	AuthBindingGeneration int64   `json:"auth_binding_generation"`
+	RatePerSecond         float64 `json:"rate_per_second"`
+	RatePerMinute         float64 `json:"rate_per_minute"`
+	ContextWindowK        int     `json:"context_window_k"`
+	ThinkingType          string  `json:"thinking_type"`
+	ReasoningEffort       string  `json:"reasoning_effort"`
+	IsDefault             bool    `json:"is_default"`
 	// Pooling (failover) parameters: higher priority is picked first (the active
 	// profile is always the chain head); pool_exclude=true excludes it as a failover target, though agents/tasks can still bind it explicitly.
 	Priority    int  `json:"priority"`
@@ -637,6 +693,13 @@ type LLMProfileDTO struct {
 	// Custom User-Agent: when non-empty, every outbound LLM request overrides its
 	// User-Agent header with this value. '' = do not override (keep the default UA).
 	UserAgent string `json:"user_agent"`
+	// API-key pricing is operator-supplied. Zero means unknown/unset and is omitted;
+	// native subscription profiles always return these fields unset because API
+	// token prices are not evidence of subscription charges.
+	PriceInputPerM      float64 `json:"price_input_per_m,omitempty"`
+	PriceOutputPerM     float64 `json:"price_output_per_m,omitempty"`
+	PriceCacheReadPerM  float64 `json:"price_cache_read_per_m,omitempty"`
+	PriceCacheWritePerM float64 `json:"price_cache_write_per_m,omitempty"`
 	// This profile's retry overrides (connect / empty response / same-provider safe
 	// window). Per item attempts: 0=inherit the global policy | -1=disable that retry
 	// layer | >0=count; interval_ms: 0=default exponential backoff | >0=use that fixed millisecond interval. All zero = fully follow the global policy, i.e. the historical behavior.
@@ -644,29 +707,40 @@ type LLMProfileDTO struct {
 }
 
 func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
+	authMode := p.AuthMode
+	if authMode == "" {
+		authMode = "api_key"
+	}
 	return LLMProfileDTO{
-		ID:               i64s(p.ID),
-		Name:             p.Name,
-		Format:           p.Format,
-		BaseURL:          p.BaseURL,
-		Proxy:            maskedSecret(p.Proxy),
-		ProxySet:         p.Proxy != "",
-		Model:            p.Model,
-		APIKeyHint:       p.APIKeyHint,
-		RatePerSecond:    p.RatePerSecond,
-		RatePerMinute:    p.RatePerMinute,
-		ContextWindowK:   p.ContextWindowK,
-		ThinkingType:     p.ThinkingType,
-		ReasoningEffort:  p.ReasoningEffort,
-		IsDefault:        p.IsDefault,
-		Priority:         p.Priority,
-		PoolExclude:      p.PoolExclude,
-		Streaming:        p.Streaming,
-		MaxTokens:        p.MaxTokens,
-		MaxTokensField:   p.MaxTokensField,
-		SessionHeaderKey: p.SessionHeaderKey,
-		UserAgent:        p.UserAgent,
-		Retry:            p.Retry,
+		ID:                    i64s(p.ID),
+		Name:                  p.Name,
+		Format:                p.Format,
+		BaseURL:               p.BaseURL,
+		Proxy:                 maskedSecret(p.Proxy),
+		ProxySet:              p.Proxy != "",
+		Model:                 p.Model,
+		APIKeyHint:            p.APIKeyHint,
+		AuthMode:              authMode,
+		CredentialID:          p.CredentialID,
+		AuthBindingGeneration: p.AuthBindingGeneration,
+		RatePerSecond:         p.RatePerSecond,
+		RatePerMinute:         p.RatePerMinute,
+		ContextWindowK:        p.ContextWindowK,
+		ThinkingType:          p.ThinkingType,
+		ReasoningEffort:       p.ReasoningEffort,
+		IsDefault:             p.IsDefault,
+		Priority:              p.Priority,
+		PoolExclude:           p.PoolExclude,
+		Streaming:             p.Streaming,
+		MaxTokens:             p.MaxTokens,
+		MaxTokensField:        p.MaxTokensField,
+		SessionHeaderKey:      p.SessionHeaderKey,
+		UserAgent:             p.UserAgent,
+		PriceInputPerM:        p.PriceInputPerM,
+		PriceOutputPerM:       p.PriceOutputPerM,
+		PriceCacheReadPerM:    p.PriceCacheReadPerM,
+		PriceCacheWritePerM:   p.PriceCacheWritePerM,
+		Retry:                 p.Retry,
 	}
 }
 

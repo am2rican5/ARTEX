@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -110,7 +110,7 @@ func TestProviderDoesNotRetryExplicitQuota429(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	provider, err := ConfigFrom("openai", "test-model", upstream.URL, "test-key", "").NewProvider()
+	provider, err := ConfigFrom("openai", "test-model", upstream.URL, "test-key", "").NewProvider(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

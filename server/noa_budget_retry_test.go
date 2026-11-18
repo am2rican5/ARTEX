@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/norma/harness"
+	"github.com/Autumn-27/artex/internal/norma/harness"
 )
 
 // A NOA budget refusal is deterministic: the engine must not rerun the intent,

@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Autumn-27/artex/internal/norma/harness"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 	"github.com/Autumn-27/artex/llmpool"
-	"github.com/Autumn-27/norma/harness"
-	"github.com/Autumn-27/norma/llm"
 )
 
 type fakeProvider struct {
@@ -124,6 +124,95 @@ func TestSnapshotExcludesPartialStreamAndSelectsPoolMember(t *testing.T) {
 	}
 }
 
+func TestNativeStateSurvivesPairedSideSnapshotAndDropsWithTransformedTurn(t *testing.T) {
+	state := &llm.ProviderState{
+		Provider:  "openai-codex-oauth",
+		Model:     "codex-native",
+		AuthScope: "account:workspace",
+		Data:      json.RawMessage(`{"version":1,"reasoning":[{"id":"r1"}]}`),
+	}
+	var calls int
+	p := Bind(fakeProvider{stream: func(context.Context, llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+		calls++
+		return func(yield func(llm.StreamEvent, error) bool) {
+			if calls > 1 {
+				yield(llm.StreamEvent{}, errors.New("stop after request checkpoint"))
+				return
+			}
+			for _, event := range []llm.StreamEvent{
+				{Type: llm.SETextDelta, Text: "using tools"},
+				{Type: llm.SEToolUseStart, ToolID: "call-a", ToolName: "read"},
+				{Type: llm.SEToolUseStart, ToolID: "call-b", ToolName: "read"},
+				{Type: llm.SEToolInputJSON, ToolID: "call-b", Text: `{"value":2}`},
+				{Type: llm.SEToolInputJSON, ToolID: "call-a", Text: `{"value":1}`},
+				{Type: llm.SEProviderState, ProviderState: state},
+				{Type: llm.SEMessageStop},
+			} {
+				if !yield(event, nil) {
+					return
+				}
+			}
+		}
+	}}, Model{Model: "codex-native", AuthMode: "oauth", CredentialID: 7, AuthBindingGeneration: 3})
+	var snapshots []Snapshot
+	ctx, deps := Attach(WithPublisher(t.Context(), func(s Snapshot) { snapshots = append(snapshots, s) }), Parent{ConversationID: 4}, harness.QueryDeps{}, p)
+	req := fixture()
+	acc := llm.NewAccumulator()
+	for event, err := range deps.CallModel(ctx, req) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		acc.Add(event)
+	}
+	if len(snapshots) != 2 {
+		t.Fatalf("first call published %d snapshots, want request and completion", len(snapshots))
+	}
+	firstCompletion := snapshots[1].Request.Messages[len(snapshots[1].Request.Messages)-1]
+	if firstCompletion.ProviderState != nil || len(firstCompletion.ToolUses()) != 0 || firstCompletion.Text() != "using tools" {
+		t.Fatalf("transformed unpaired turn retained opaque state or tools: %+v", firstCompletion)
+	}
+
+	reply := acc.Message()
+	req.Messages = append(req.Messages, reply, llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{
+		llm.ToolResultText("call-a", "one", false),
+		llm.ToolResultText("call-b", "two", false),
+	}})
+	for range deps.CallModel(ctx, req) {
+	}
+	paired := snapshots[len(snapshots)-1]
+	got := paired.Request.Messages[len(paired.Request.Messages)-2]
+	uses := got.ToolUses()
+	if len(uses) != 2 || string(uses[0].Input) != `{"value":1}` || string(uses[1].Input) != `{"value":2}` {
+		t.Fatalf("explicit tool delta routing was lost: %+v", uses)
+	}
+	if got.ProviderState == nil || got.ProviderState.AuthScope != "account:workspace" || string(got.ProviderState.Data) != string(state.Data) {
+		t.Fatalf("paired checkpoint lost provider state: %+v", got.ProviderState)
+	}
+
+	encoded := mustJSON(t, paired)
+	var resumed Snapshot
+	if err := json.Unmarshal(encoded, &resumed); err != nil {
+		t.Fatal(err)
+	}
+	resumedState := resumed.Request.Messages[len(resumed.Request.Messages)-2].ProviderState
+	if resumedState == nil || string(resumedState.Data) != string(state.Data) {
+		t.Fatalf("serialized side snapshot lost provider state: %+v", resumedState)
+	}
+	resumedState.Data[0] = '['
+	if got.ProviderState.Data[0] != '{' {
+		t.Fatal("resumed side snapshot aliases the published checkpoint")
+	}
+
+	built, err := BuildRequest(paired, nil, "what happened?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	builtState := built.Messages[len(req.Messages)-2].ProviderState
+	if builtState == nil || string(builtState.Data) != string(state.Data) {
+		t.Fatalf("side request projection lost intact provider state: %+v", builtState)
+	}
+}
+
 func TestBuildRequestCompactionToolPairingAndBudget(t *testing.T) {
 	s := Snapshot{Request: fixture(), Model: Model{WindowTokens: 100000}}
 	s.Request.Messages = append(s.Request.Messages, llm.BoundaryMessage(llm.BoundaryMeta{Trigger: "auto"}), llm.UserText("compressed summary"), s.Request.Messages[3])
@@ -195,6 +284,13 @@ func TestServiceNoToolsAndUsageOnFailure(t *testing.T) {
 	out, err := (SideQuestionService{p}).Answer(t.Context(), fixture(), true, nil)
 	if err == nil || out.Text != "partial" || out.Usage.InputTokens != 12 {
 		t.Fatalf("lost failure usage/partial: %+v %v", out, err)
+	}
+	atomic := fakeProvider{complete: func(context.Context, llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("partial atomic")}}, "", llm.Usage{InputTokens: 17, OutputTokens: 4}, errors.New("native terminal failure")
+	}}
+	out, err = (SideQuestionService{atomic}).Answer(t.Context(), fixture(), false, nil)
+	if err == nil || out.Text != "partial atomic" || out.Usage.InputTokens != 17 || out.Usage.OutputTokens != 4 {
+		t.Fatalf("lost atomic failure usage/partial: %+v %v", out, err)
 	}
 }
 

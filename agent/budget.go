@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/internal/norma/llm"
 )
 
 // Hierarchical run budgets (off by default). Levels: task -> intent (one worker

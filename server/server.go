@@ -25,13 +25,13 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/internal/norma/llm"
+	actool "github.com/Autumn-27/artex/internal/norma/tool"
+	"github.com/Autumn-27/artex/internal/norma/transcript"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
-	"github.com/Autumn-27/norma/llm"
-	actool "github.com/Autumn-27/norma/tool"
-	"github.com/Autumn-27/norma/transcript"
 )
 
 // BuildVersion is the backend application version, injected from cmd/artex at
@@ -289,10 +289,32 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 // Restored deadline and worker loops must inherit the same context as new tasks,
 // including the side-question checkpoint publisher installed during startup.
 func (s *Server) restoreTaskRuntimes() {
+	if s == nil || s.m == nil || s.ctx != nil && s.ctx.Err() != nil {
+		return
+	}
 	m := s.m
-	// reload tasks persisted on disk so the task list survives a restart, and
-	// restore persisted paused state (so a task paused before restart stays paused).
-	for _, t := range m.LoadExisting() {
+	// Only rows materialized by this startup load need crash recovery. Existing
+	// in-process tasks may already have healthy native work in flight and must
+	// never be reclassified as restart recovery by a later runtime wake-up.
+	loaded := m.LoadExisting()
+	for _, t := range loaded {
+		if s.ctx != nil && s.ctx.Err() != nil {
+			return
+		}
+		held, err := s.prepareNativeTaskRecovery(t)
+		if err != nil {
+			if s.ctx != nil && s.ctx.Err() != nil {
+				return
+			}
+			log.Printf("[engine] task %s native recovery preparation failed; automatic restart is blocked: %v", t.ID, err)
+			continue
+		}
+		if held {
+			continue
+		}
+		if s.ctx != nil && s.ctx.Err() != nil {
+			return
+		}
 		lifecycle := t.lifecycleSnapshot()
 		// clear stale 'running' intents from a prior crash/restart (no live worker
 		// owns them) so they re-claim instead of spinning forever in the UI.
@@ -312,9 +334,15 @@ func (s *Server) restoreTaskRuntimes() {
 	// only the active UI task left other non-queued tasks counted as concurrency
 	// occupants without live loops, which could permanently block the persistent
 	// FIFO. Paused loops remain idle; queued tasks are admitted below as slots allow.
+	if s.ctx != nil && s.ctx.Err() != nil {
+		return
+	}
 	for _, t := range m.List() {
+		if s.ctx != nil && s.ctx.Err() != nil {
+			return
+		}
 		lifecycle := t.lifecycleSnapshot()
-		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
+		if !lifecycle.NativeRecoveryHold && !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
 			s.engine.Run(s.ctx, t)
 		}
 	}
@@ -346,13 +374,20 @@ func (s *Server) agentRunSeconds(key string) int {
 	return a.RunSecs
 }
 
-// loadLLMConfig reads the active LLM profile from PG (llm_profiles).
-func (s *Server) loadLLMConfig() (agent.Config, bool) {
-	p, err := s.m.pg.ActiveProfile()
-	if err != nil || p == nil {
-		return agent.Config{}, false
-	}
+// configFromProfile projects the persisted profile identity and model options
+// into the comparable runtime config. Credential material remains in the
+// subscription manager; only the stable binding reference crosses this layer.
+func (s *Server) configFromProfile(p *db.LLMProfile) agent.Config {
 	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
+	cfg.ProfileID = p.ID
+	cfg.AuthMode = p.AuthMode
+	if cfg.AuthMode == "" {
+		cfg.AuthMode = "api_key"
+	}
+	if p.CredentialID != nil {
+		cfg.CredentialID = *p.CredentialID
+	}
+	cfg.AuthBindingGeneration = p.AuthBindingGeneration
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
 	cfg.ContextWindowK = p.ContextWindowK
 	cfg.ThinkingType = p.ThinkingType
@@ -362,7 +397,18 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
 	s.applyProfileRetry(&cfg, p)
-	// Ollama profiles run keyless (local server); the other formats need a key.
+	return cfg
+}
+
+// loadLLMConfig reads the active LLM profile from PG (llm_profiles). A selected
+// native profile remains configured even while its credential is expired,
+// revoked, or otherwise requires reauthorization.
+func (s *Server) loadLLMConfig() (agent.Config, bool) {
+	p, err := s.m.pg.ActiveProfile()
+	if err != nil || p == nil {
+		return agent.Config{}, false
+	}
+	cfg := s.configFromProfile(p)
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
 	}
@@ -378,6 +424,15 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	// (anthropic / openai / openai-responses), matching the DB CHECK constraint.
 	format := cfg.Provider()
 	var id int64
+	authMode := cfg.AuthMode
+	if authMode == "" {
+		authMode = "api_key"
+	}
+	var credentialID *int64
+	if authMode == "oauth" && cfg.CredentialID > 0 {
+		selectedCredentialID := cfg.CredentialID
+		credentialID = &selectedCredentialID
+	}
 	// This legacy endpoint's request body carries no failover/streaming/output-cap params, so the values already stored in the DB are passed back untouched —
 	// otherwise every save would silently reset the profile's priority, pool_exclude, streaming and output caps
 	// (max_tokens / max_tokens_field) to zero values.
@@ -403,7 +458,8 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	}
 	newID, err := s.m.pg.SaveProfile(&db.LLMProfile{
 		ID: id, Name: "default", Format: format, Model: cfg.Model, BaseURL: cfg.BaseURL, Proxy: cfg.Proxy,
-		APIKey: cfg.APIKey, RatePerSecond: cfg.RatePerSecond, RatePerMinute: cfg.RatePerMinute,
+		APIKey: cfg.APIKey, AuthMode: authMode, CredentialID: credentialID,
+		RatePerSecond: cfg.RatePerSecond, RatePerMinute: cfg.RatePerMinute,
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey, UserAgent: userAgent,
@@ -467,7 +523,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	}
 	if prov == nil {
 		var err error
-		prov, err = cfg.NewProvider()
+		prov, err = cfg.NewProvider(s.m.Subscriptions())
 		if err != nil {
 			return err
 		}
@@ -520,24 +576,15 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	return nil
 }
 
-// loadProfileConfig builds an agent.Config from a specific profile id (with its key).
-// ok=false when the profile is missing or unusable (no api key for the key-requiring
-// formats).
+// loadProfileConfig builds an agent.Config from a specific profile id. Native
+// OAuth profiles are keyless and remain selectable through every credential
+// lifecycle state; readiness is resolved only when the provider is used.
 func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	p, err := s.m.pg.ProfileByID(id)
 	if err != nil || p == nil {
 		return agent.Config{}, false
 	}
-	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
-	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
-	cfg.ContextWindowK = p.ContextWindowK
-	cfg.ThinkingType = p.ThinkingType
-	cfg.ReasoningEffort = p.ReasoningEffort
-	cfg.Stream = p.Streaming
-	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
-	cfg.SessionHeaderKey = p.SessionHeaderKey
-	cfg.UserAgent = p.UserAgent
-	s.applyProfileRetry(&cfg, p)
+	cfg := s.configFromProfile(p)
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
 	}
@@ -568,7 +615,10 @@ func (s *Server) resolveChatAgent(c *db.Conversation) *agent.ChatAgent {
 	ca := s.chatAgentRef()
 	if eff := s.effectiveProfileForAgent(c.AgentKey, c.LLMProfileID); eff != nil {
 		if pa := s.chatAgentForProfile(*eff); pa != nil {
-			ca = pa
+			return pa
+		}
+		if s.nativeProfileSelectionError(*eff) != nil {
+			return nil
 		}
 	}
 	return ca
@@ -604,7 +654,7 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 	if !ok {
 		return nil, agent.Config{}, false
 	}
-	prov, err := cfg.NewProvider()
+	prov, err := cfg.NewProvider(s.m.Subscriptions())
 	if err != nil {
 		log.Printf("[engine] build provider for LLM profile %d failed: %v", id, err)
 		return nil, agent.Config{}, false
@@ -772,6 +822,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm", s.getLLM)
 	mux.HandleFunc("POST /api/llm", s.setLLM)
 	mux.HandleFunc("POST /api/llm/test", s.testLLM)
+	mux.HandleFunc("GET /api/llm/credentials", s.listLLMCredentials)
+	mux.HandleFunc("POST /api/llm/credentials/login", s.loginLLMCredential)
+	mux.HandleFunc("GET /api/llm/credentials/attempt/{id}", s.getLLMCredentialAttempt)
+	mux.HandleFunc("POST /api/llm/credentials/attempt/{id}/submit", s.submitLLMCredentialAttempt)
+	mux.HandleFunc("POST /api/llm/credentials/{id}/disconnect", s.disconnectLLMCredential)
 
 	// asset system
 	mux.HandleFunc("GET /api/assets", s.listAssets)
@@ -1359,71 +1414,122 @@ func (s *Server) rerunBlocked(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"id": t.ID, "reopened": n, "queued": queued})
 }
 
-// getLLM returns the current LLM config (key never exposed).
+// getLLM returns the current LLM config (key and credential payload never exposed).
 func (s *Server) getLLM(w http.ResponseWriter, r *http.Request) {
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
+	var profileID any
+	if s.llmCfg.ProfileID > 0 {
+		profileID = s.llmCfg.ProfileID
+	}
+	authMode := s.llmCfg.AuthMode
+	if authMode == "" {
+		authMode = "api_key"
+	}
+	var credentialID any
+	if s.llmCfg.CredentialID > 0 {
+		credentialID = s.llmCfg.CredentialID
+	}
 	writeJSON(w, 200, map[string]any{
-		"configured":       s.llmOn,
-		"provider":         s.llmCfg.Provider(),
-		"model":            s.llmCfg.Model,
-		"base_url":         s.llmCfg.BaseURL,
-		"proxy":            maskedSecret(s.llmCfg.Proxy),
-		"proxy_set":        s.llmCfg.Proxy != "",
-		"key_set":          s.llmCfg.APIKey != "",
-		"rate_per_second":  s.llmCfg.RatePerSecond,
-		"rate_per_minute":  s.llmCfg.RatePerMinute,
-		"context_window_k": s.llmCfg.ContextWindowK,
-		"thinking_type":    s.llmCfg.ThinkingType,
-		"reasoning_effort": s.llmCfg.ReasoningEffort,
+		"configured":              s.llmOn,
+		"profile_id":              profileID,
+		"auth_mode":               authMode,
+		"credential_id":           credentialID,
+		"auth_binding_generation": s.llmCfg.AuthBindingGeneration,
+		"provider":                s.llmCfg.Provider(),
+		"model":                   s.llmCfg.Model,
+		"base_url":                s.llmCfg.BaseURL,
+		"proxy":                   maskedSecret(s.llmCfg.Proxy),
+		"proxy_set":               s.llmCfg.Proxy != "",
+		"key_set":                 s.llmCfg.APIKey != "",
+		"rate_per_second":         s.llmCfg.RatePerSecond,
+		"rate_per_minute":         s.llmCfg.RatePerMinute,
+		"context_window_k":        s.llmCfg.ContextWindowK,
+		"thinking_type":           s.llmCfg.ThinkingType,
+		"reasoning_effort":        s.llmCfg.ReasoningEffort,
 	})
 }
 
 // setLLM configures the LLM at runtime. A blank api_key keeps the existing key.
 func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider        string  `json:"provider"`
-		Model           string  `json:"model"`
-		BaseURL         string  `json:"base_url"`
-		Proxy           string  `json:"proxy"`
-		APIKey          string  `json:"api_key"`
-		RatePerSecond   float64 `json:"rate_per_second"`
-		RatePerMinute   float64 `json:"rate_per_minute"`
-		ContextWindowK  int     `json:"context_window_k"`
-		ThinkingType    string  `json:"thinking_type"`
-		ReasoningEffort string  `json:"reasoning_effort"`
+		Provider              string  `json:"provider"`
+		Model                 string  `json:"model"`
+		BaseURL               string  `json:"base_url"`
+		Proxy                 string  `json:"proxy"`
+		APIKey                string  `json:"api_key"`
+		AuthMode              string  `json:"auth_mode"`
+		CredentialID          *int64  `json:"credential_id"`
+		ProfileID             *int64  `json:"profile_id"`
+		AuthBindingGeneration int64   `json:"auth_binding_generation"`
+		RatePerSecond         float64 `json:"rate_per_second"`
+		RatePerMinute         float64 `json:"rate_per_minute"`
+		ContextWindowK        int     `json:"context_window_k"`
+		ThinkingType          string  `json:"thinking_type"`
+		ReasoningEffort       string  `json:"reasoning_effort"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	s.cfgMu.Lock()
+	current := s.llmCfg
+	s.cfgMu.Unlock()
 	if isMaskedSecret(req.Proxy) { // getLLM returns the proxy masked: keep the current one
-		s.cfgMu.Lock()
-		req.Proxy = s.llmCfg.Proxy
-		s.cfgMu.Unlock()
+		req.Proxy = current.Proxy
 	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	cfg.Stream = current.Stream
+	cfg.MaxTokens, cfg.MaxTokensField = current.MaxTokens, current.MaxTokensField
+	cfg.SessionHeaderKey = current.SessionHeaderKey
+	cfg.UserAgent = current.UserAgent
+	cfg.Retry = current.Retry
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
+	if strings.TrimSpace(req.AuthMode) == "" {
+		cfg.ProfileID = current.ProfileID
+		cfg.AuthMode = current.AuthMode
+		cfg.CredentialID = current.CredentialID
+		cfg.AuthBindingGeneration = current.AuthBindingGeneration
+	} else {
+		cfg.AuthMode = strings.TrimSpace(req.AuthMode)
+		if req.ProfileID != nil {
+			cfg.ProfileID = *req.ProfileID
+		} else {
+			cfg.ProfileID = current.ProfileID
+		}
+		if req.CredentialID != nil {
+			cfg.CredentialID = *req.CredentialID
+			cfg.AuthBindingGeneration = req.AuthBindingGeneration
+			if cfg.AuthBindingGeneration == 0 && cfg.CredentialID == current.CredentialID && cfg.ProfileID == current.ProfileID {
+				cfg.AuthBindingGeneration = current.AuthBindingGeneration
+			}
+		} else if cfg.AuthMode == "oauth" && current.AuthMode == "oauth" {
+			cfg.CredentialID = current.CredentialID
+			cfg.AuthBindingGeneration = current.AuthBindingGeneration
+		}
+	}
+	if cfg.AuthMode == "oauth" && current.AuthMode == "oauth" && cfg.CredentialID == current.CredentialID && cfg.Format != current.Format {
+		writeErr(w, 400, "native LLM provider format cannot be changed by the legacy settings endpoint")
+		return
+	}
 	if k := req.ContextWindowK; k > 0 { // 0 = keep default (200K); cap at 1M
 		if k > 1000 {
 			k = 1000
 		}
 		cfg.ContextWindowK = k
 	}
-	// Keyless formats (Ollama) need no key; the others keep/require one.
+	// Keyless formats and native OAuth profiles never enter raw-key resolution.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
-		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey // keep existing key if not re-entered
-		s.cfgMu.Unlock()
+		cfg.APIKey = current.APIKey // keep existing key if not re-entered
 	}
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		writeErr(w, 400, "api_key required")
 		return
 	}
 	// Validate provider construction before persisting it as the active profile.
-	if _, err := cfg.NewProvider(); err != nil {
+	if _, err := cfg.NewProvider(s.m.Subscriptions()); err != nil {
 		writeErr(w, 400, "provider init failed: "+err.Error())
 		return
 	}
@@ -1432,11 +1538,12 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.invalidateProfileAgents()
-	if _, ok := s.loadLLMConfig(); !ok {
+	saved, ok := s.loadLLMConfig()
+	if !ok {
 		writeErr(w, 500, "saved provider is unavailable")
 		return
 	}
-	if err := s.applyLLM(cfg); err != nil {
+	if err := s.applyLLM(saved); err != nil {
 		writeErr(w, 400, "provider init failed: "+err.Error())
 		return
 	}
@@ -1447,17 +1554,20 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 // testLLM makes a real minimal completion to verify the config works.
 func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider         string `json:"provider"`
-		Model            string `json:"model"`
-		BaseURL          string `json:"base_url"`
-		Proxy            string `json:"proxy"`
-		APIKey           string `json:"api_key"`
-		ThinkingType     string `json:"thinking_type"`
-		ReasoningEffort  string `json:"reasoning_effort"`
-		ProfileID        *int64 `json:"profile_id"`         // passed when testing a stored profile: if api_key is empty, its stored key is used
-		Streaming        *bool  `json:"streaming"`          // omitted = streaming, the same defaults as when saving a profile
-		SessionHeaderKey string `json:"session_header_key"` // non-empty = the test also sends this custom session header, with a one-off random session id as the value
-		UserAgent        string `json:"user_agent"`         // non-empty = the test overrides the User-Agent header with this value (mirrors production)
+		Provider              string `json:"provider"`
+		Model                 string `json:"model"`
+		BaseURL               string `json:"base_url"`
+		Proxy                 string `json:"proxy"`
+		APIKey                string `json:"api_key"`
+		AuthMode              string `json:"auth_mode"`
+		CredentialID          *int64 `json:"credential_id"`
+		AuthBindingGeneration int64  `json:"auth_binding_generation"`
+		ThinkingType          string `json:"thinking_type"`
+		ReasoningEffort       string `json:"reasoning_effort"`
+		ProfileID             *int64 `json:"profile_id"`         // passed when testing a stored profile: native binding or stored API key is used
+		Streaming             *bool  `json:"streaming"`          // omitted = streaming, the same defaults as when saving a profile
+		SessionHeaderKey      string `json:"session_header_key"` // non-empty = the test also sends this custom session header, with a one-off random session id as the value
+		UserAgent             string `json:"user_agent"`         // native providers reject overrides because their protocol owns this header
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1470,9 +1580,16 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// form left empty from the row first; explicit form values still win.
 	var stored *db.LLMProfile
 	if req.ProfileID != nil {
-		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			stored = p
+		p, err := s.m.pg.ProfileByID(*req.ProfileID)
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": "selected LLM profile could not be loaded"})
+			return
 		}
+		if p == nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": "selected LLM profile was not found"})
+			return
+		}
+		stored = p
 	}
 	if isMaskedSecret(req.Proxy) { // the form echoes the masked proxy: test with the stored one
 		req.Proxy = ""
@@ -1506,7 +1623,44 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 			req.ReasoningEffort = stored.ReasoningEffort
 		}
 	}
+	if stored != nil {
+		req.AuthMode = stored.AuthMode
+		req.CredentialID = stored.CredentialID
+		req.AuthBindingGeneration = stored.AuthBindingGeneration
+	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	cfg.AuthMode = strings.TrimSpace(req.AuthMode)
+	if cfg.AuthMode == "" {
+		cfg.AuthMode = "api_key"
+	}
+	if req.ProfileID != nil {
+		cfg.ProfileID = *req.ProfileID
+	}
+	if req.CredentialID != nil {
+		cfg.CredentialID = *req.CredentialID
+	}
+	cfg.AuthBindingGeneration = req.AuthBindingGeneration
+	if cfg.AuthMode == "oauth" && cfg.ProfileID == 0 && cfg.CredentialID > 0 {
+		profiles, err := s.m.pg.ListProfiles()
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": "native profile binding could not be loaded"})
+			return
+		}
+		for _, profile := range profiles {
+			if profile.AuthMode != "oauth" || profile.CredentialID == nil || *profile.CredentialID != cfg.CredentialID {
+				continue
+			}
+			if agent.ConfigFrom(profile.Format, "", "", "", "").Format != cfg.Format {
+				continue
+			}
+			cfg.ProfileID = profile.ID
+			cfg.AuthBindingGeneration = profile.AuthBindingGeneration
+			break
+		}
+	}
+	if stored != nil {
+		cfg.MaxTokens, cfg.MaxTokensField = stored.MaxTokens, stored.MaxTokensField
+	}
 	// mirror production: send the SAME thinking params so a provider that rejects the
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
 	cfg.ThinkingType = req.ThinkingType
@@ -1581,7 +1735,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// Retry params do [not] go into the connection test: the test has a 30s hard timeout, and stacking the configured retry counts/long intervals on top
 	// would only turn a perfectly usable endpoint into a "timeout failure". The test asks "does this endpoint work at all"; retry pacing
 	// is a runtime concern.
-	lat, reply, err := agent.TestConnection(r.Context(), cfg)
+	lat, reply, err := agent.TestConnection(r.Context(), cfg, s.m.Subscriptions())
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
 		return

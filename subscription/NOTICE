@@ -1,0 +1,42 @@
+Native subscription translation provenance
+==========================================
+
+Portions of this package's OAuth protocol declarations, provider catalog data,
+request/response transformations, and direct Anthropic Messages and OpenAI
+Codex Responses transport behavior were translated or adapted from Oh My Pi
+(OMP):
+
+  Project: https://github.com/can1357/oh-my-pi
+  Commit: 1bdbf6d242d99ca62bdf2feeff4519ff992f647d
+  License: MIT (preserved verbatim in LICENSE.omp)
+
+Principal pinned source references:
+  OAuth declarations and lifecycle:
+    packages/catalog/src/compat/rules/auth/anthropic.kdl
+    packages/catalog/src/compat/rules/auth/openai-codex.kdl
+    packages/ai/src/registry/engine/oauth-code.ts
+    packages/ai/src/auth/refresh.ts
+    packages/ai/src/registry/oauth/anthropic.ts
+    packages/ai/src/registry/oauth/openai-codex.ts
+
+  Provider catalogs and compatibility data:
+    packages/catalog/src/models.json
+    packages/catalog/src/compat/rules/providers/anthropic.kdl
+    packages/catalog/src/compat/rules/providers/openai-codex.kdl
+
+  Anthropic request/response and transport behavior:
+    packages/ai/src/providers/anthropic.ts
+    packages/ai/src/providers/anthropic-client.ts
+
+  OpenAI Codex request/response and transport behavior:
+    packages/ai/src/providers/openai-codex-responses.ts
+    packages/ai/src/providers/openai-codex/request-transformer.ts
+    packages/ai/src/providers/openai-codex/response-handler.ts
+    packages/ai/src/providers/openai-codex-transport.ts
+
+The MIT license in LICENSE.omp applies to the translated or adapted OMP
+portions. This notice does not replace ARTEX's root license and does not claim
+that unrelated ARTEX code originated in OMP.
+
+ARTEX implements these portions as native Go code. It does not execute or
+require OMP, Bun, the Claude CLI, or the Codex CLI at runtime.

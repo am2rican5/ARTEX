@@ -1,0 +1,16 @@
+# Opt-in callback exposure for native subscription browser authorization.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.oauth.yml up -d --build
+# Keep using both files for later compose operations on this deployment.
+services:
+  artex:
+    environment:
+      # Container-only bind: Docker cannot publish a listener bound to the
+      # container's own 127.0.0.1. The host publications below remain loopback-only.
+      ARTEX_OAUTH_CALLBACK_LISTEN_HOST: 0.0.0.0
+    ports:
+      # Fixed provider redirect contracts. Never publish these on a LAN address.
+      - "127.0.0.1:54545:54545"
+      - "127.0.0.1:1455:1455"
+    # Normal shutdown budgets 10s for HTTP, 30s for task settlement with the
+    # database open, then 60s for native/auth close (30s per auth HTTP operation).
+    stop_grace_period: 2m

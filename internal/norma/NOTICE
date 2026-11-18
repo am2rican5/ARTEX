@@ -1,0 +1,56 @@
+Norma in-tree fork provenance
+=============================
+
+This directory contains the runtime library source and regression tests from
+Norma v0.4.10.
+
+Upstream source:
+  Project: https://github.com/BaaRai/Norma
+  Canonical module path at that release: github.com/Autumn-27/norma
+  Release: v0.4.10
+  Commit: 4c01427b312a03084461c648cc65ac8c6c73b944
+  License: Apache License 2.0 (preserved verbatim in LICENSE)
+
+The v0.4.10 source distribution did not contain an upstream NOTICE file. This
+NOTICE records ARTEX's provenance and modifications; it does not alter the
+Apache License 2.0 terms.
+
+Included source:
+  agentcore, compaction, coordinator, harness, hook, llm, mcp, memory, noa,
+  noaadapter, permission, plan, skill, subagent, tool, and transcript packages,
+  including their upstream regression tests and platform-specific files.
+
+Intentionally excluded:
+  - cmd/agentcore and examples/, which are standalone command/demo binaries and
+    are not part of ARTEX's in-process SDK runtime.
+  - the upstream go.mod and go.sum, because this fork belongs to the ARTEX root
+    module rather than a nested module.
+  - upstream VCS/editor metadata and the upstream repository README.
+
+ARTEX fork modifications:
+  - Rewrote Norma self-imports to
+    github.com/Autumn-27/artex/internal/norma/<subpackage>.
+  - Added typed, JSON-persistent opaque ProviderState on llm.Message and
+    StreamEvent, plus SEProviderState.
+  - Added Accumulator ownership isolation and Reset behavior for provider state.
+  - Preserved state through intact API/NOA projections, cloned NOA raw data,
+    and discarded state whenever projection removes or rewrites its source turn.
+  - Prevented built-in Anthropic, OpenAI Chat Completions, and OpenAI Responses
+    wire encoders from forwarding ProviderState, while retaining existing
+    Anthropic thinking/redacted-thinking and Gemini thought signatures.
+  - Clarified that Provider.Complete returns an assembled message and that a
+    provider implementation may collect mandatory upstream streaming; existing
+    built-in API-key providers retain their non-streaming wire behavior.
+  - Added regression coverage for transcript persistence/resume, accumulator
+    alias isolation/reset, context projection, and actual outgoing built-in
+    provider wire omission.
+  - Routed interleaved native-provider tool-input fragments by optional tool
+    call ID while preserving legacy most-recent-call delta semantics.
+  - Added a wrapped-error opt-out marker for physical model-request retries and
+    propagated it through stream establishment, the harness, compaction, and
+    NOA overflow handling so native terminal or uncertain outcomes are not
+    automatically replayed.
+  - On those terminal stream errors, discarded unfinished tool-call fragments
+    instead of repairing partial arguments to an empty object and executing it.
+
+No external Norma CLI is built or used by ARTEX.

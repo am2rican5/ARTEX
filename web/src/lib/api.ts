@@ -56,6 +56,12 @@ import type {
   InterceptRule,
   JudgeConfig,
   JudgeUsage,
+  LLMAuthMode,
+  LLMCredential,
+  LLMCredentialAttempt,
+  LLMCredentialDisconnect,
+  LLMCredentialProvider,
+  LLMModelCatalogEntry,
   LLMPoolStatus,
   LLMProfile,
   LLMRecordDetail,
@@ -120,10 +126,12 @@ function getToken(): string | null {
 // failures apart.
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  code?: string;
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -149,15 +157,19 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (!r.ok) {
     const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
     let message = fallback;
+    let code: string | undefined;
     try {
-      const payload = (await r.json()) as { error?: unknown };
+      const payload = (await r.json()) as { error?: unknown; code?: unknown };
       if (typeof payload.error === "string" && payload.error.trim()) {
         message = payload.error.trim();
+      }
+      if (typeof payload.code === "string" && payload.code.trim()) {
+        code = payload.code.trim();
       }
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    throw new ApiError(message, r.status);
+    throw new ApiError(message, r.status, code);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -878,8 +890,7 @@ export const api = {
   // Channels are multi-instance resources (several bots of the same kind, each with its own
   // filter rules), so they form their own group instead of the flat settings key/value store.
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;
@@ -983,36 +994,28 @@ export const api = {
     proxy = "",
     context_window_k = 0,
   ) => post("/llm", { provider, model, base_url, proxy, api_key, rate_per_second, rate_per_minute, context_window_k }),
-  testLLM: (
-    provider: string,
-    model: string,
-    base_url: string,
-    api_key: string,
-    proxy = "",
-    thinking_type = "",
-    reasoning_effort = "",
-    profile_id?: number,
-    streaming = true, // test with the profile's real streaming mode so "streaming works, non-streaming does not" never leaks into conversations
-    session_header_key = "", // non-empty = the test request also carries this custom session header (value is a one-off session id)
-    user_agent = "", // non-empty = the test overrides the User-Agent header with this value
-  ) =>
+  testLLM: (input: {
+    provider: string;
+    model: string;
+    base_url?: string;
+    api_key?: string;
+    proxy?: string;
+    thinking_type?: string;
+    reasoning_effort?: string;
+    profile_id?: number;
+    credential_id?: number;
+    auth_mode?: LLMAuthMode;
+    streaming?: boolean;
+    session_header_key?: string;
+    user_agent?: string;
+  }) =>
     // reply = the model's actual reply (truncated); the backend marks a profile that replies with nothing as failed
-    post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
-      provider,
-      model,
-      base_url,
-      proxy,
-      api_key,
-      thinking_type,
-      reasoning_effort,
-      profile_id,
-      streaming,
-      session_header_key,
-      user_agent,
-    }),
+    post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", input),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
     id?: number; // omit/0 = create; set = update that profile
+    auth_mode?: LLMAuthMode; // absent keeps the stored mode on update; create defaults to api_key
+    credential_id?: number | null; // absent keeps, null clears, number binds
     name: string;
     format: string;
     model: string;
@@ -1032,6 +1035,10 @@ export const api = {
     session_header_key?: string; // non-empty = send this HTTP header on every request, value = the current session id; "" = not sent
     user_agent?: string; // non-empty = override the User-Agent header on every request; "" = keep the default UA
     retry?: LLMRetryOverride; // this profile's retry override; all zeros = follow the global retry policy
+    price_input_per_m?: number;
+    price_output_per_m?: number;
+    price_cache_read_per_m?: number;
+    price_cache_write_per_m?: number;
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
   activateLLMProfile: (id: string) => post<{ ok: boolean }>("/llm/profiles/active", { id: Number(id) }),
@@ -1042,13 +1049,42 @@ export const api = {
   // Global retry policy (count + interval for each of the five layers). All zeros = built-in defaults everywhere.
   llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
-  fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
-    post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", {
-      provider,
-      base_url,
-      api_key,
-      proxy,
-      profile_id,
+  fetchLLMModels: (input: {
+    provider: string;
+    base_url?: string;
+    api_key?: string;
+    proxy?: string;
+    profile_id?: number;
+    credential_id?: number;
+    auth_mode?: LLMAuthMode;
+  }) =>
+    post<{
+      ok: boolean;
+      error?: string;
+      models?: Array<string | LLMModelCatalogEntry>;
+      source?: "pinned_catalog";
+      availability?: "unknown";
+    }>("/llm/models", input),
+  llmCredentials: (signal?: AbortSignal) => http<LLMCredential[]>("/llm/credentials", { signal }).then(arr),
+  loginLLMCredential: (provider: LLMCredentialProvider, credential_id?: number, signal?: AbortSignal) =>
+    http<LLMCredentialAttempt>("/llm/credentials/login", {
+      method: "POST",
+      body: JSON.stringify({ provider, ...(credential_id ? { credential_id } : {}) }),
+      signal,
+    }),
+  llmCredentialAttempt: (id: string, signal?: AbortSignal) =>
+    http<LLMCredentialAttempt>(`/llm/credentials/attempt/${encodeURIComponent(id)}`, { signal }),
+  submitLLMCredentialAttempt: (id: string, redirect_url: string, signal?: AbortSignal) =>
+    http<LLMCredentialAttempt>(`/llm/credentials/attempt/${encodeURIComponent(id)}/submit`, {
+      method: "POST",
+      body: JSON.stringify({ redirect_url }),
+      signal,
+    }),
+  disconnectLLMCredential: (id: number, signal?: AbortSignal) =>
+    http<LLMCredentialDisconnect>(`/llm/credentials/${id}/disconnect`, {
+      method: "POST",
+      body: JSON.stringify({}),
+      signal,
     }),
 
   // ---- agents ----
@@ -1153,8 +1189,12 @@ export const api = {
     t: Pick<Tool, "description" | "schema" | "agents" | "enabled" | "kind" | "exec" | "deferred">,
   ) => put<{ ok: boolean }>(`/tools/custom/${key}`, t),
   deleteCustomTool: (key: string) => del<{ deleted: string }>(`/tools/custom/${key}`),
-  testCustomTool: (body: { key?: string; kind: string; exec: Record<string, unknown>; params: Record<string, unknown> }) =>
-    post<{ output: string; is_error: boolean }>("/tools/custom/test", body),
+  testCustomTool: (body: {
+    key?: string;
+    kind: string;
+    exec: Record<string, unknown>;
+    params: Record<string, unknown>;
+  }) => post<{ output: string; is_error: boolean }>("/tools/custom/test", body),
   detectPython: () => post<{ python_interpreter: string }>("/settings/python/detect", {}),
 
   // ---- mcp ----
