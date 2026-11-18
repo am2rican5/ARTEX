@@ -295,17 +295,14 @@ func (s *Server) DrainTaskRuntimes(ctx context.Context) error {
 		s.m.BeginNativeShutdown()
 	}
 
-	components := make(map[string]struct{}, 4)
-	results := make(chan nativeDrainResult, 4)
+	components := make(map[string]struct{}, 3)
+	results := make(chan nativeDrainResult, 3)
 	start := func(name string, wait func() error) {
 		components[name] = struct{}{}
 		go func() { results <- nativeDrainResult{name: name, err: wait()} }()
 	}
 
-	if s.engine != nil {
-		taskDone := s.engine.beginRuntimeDrain()
-		start("task runtimes", func() error { <-taskDone; return nil })
-	}
+	start("task runtimes and archive worker", func() error { return s.Wait(ctx) })
 
 	chatDone := s.beginChatDrain()
 	start("main-agent runtimes", func() error { <-chatDone; return nil })
@@ -314,11 +311,6 @@ func (s *Server) DrainTaskRuntimes(ctx context.Context) error {
 		sideDone := s.beginSideQuestionDrain()
 		start("side-question persistence", func() error { return <-sideDone })
 	}
-
-	start("archive worker", func() error {
-		s.archiveWG.Wait()
-		return nil
-	})
 
 	var joined []string
 	var drainErrs []error
@@ -364,41 +356,6 @@ func (s *Server) DrainTaskRuntimes(ctx context.Context) error {
 	}
 	log.Printf("[shutdown] runtime drain complete; joined=%s", strings.Join(joined, ", "))
 	return nil
-}
-
-func (e *Engine) beginRuntimeDrain() <-chan struct{} {
-	done := make(chan struct{})
-	e.deleteMu.Lock()
-	e.draining.Store(true)
-	e.deleteMu.Unlock()
-
-	e.runtimeMu.Lock()
-	runtimes := make([]*taskRuntime, 0, len(e.runtimes))
-	for _, runtime := range e.runtimes {
-		runtime.cancel()
-		runtimes = append(runtimes, runtime)
-	}
-	e.runtimeMu.Unlock()
-
-	e.execMu.Lock()
-	for _, cancel := range e.execCancel {
-		cancel(agent.AbortShutdown)
-	}
-	e.execMu.Unlock()
-
-	e.workMu.Lock()
-	for _, run := range e.work {
-		run.cancel(agent.AbortShutdown)
-	}
-	e.workMu.Unlock()
-
-	go func() {
-		for _, runtime := range runtimes {
-			runtime.wg.Wait()
-		}
-		close(done)
-	}()
-	return done
 }
 
 func (s *Server) beginChatDrain() <-chan struct{} {

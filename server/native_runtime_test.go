@@ -218,8 +218,9 @@ func TestLegacyLLMConfigSavePreservesNativeReference(t *testing.T) {
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{},
 		taskAgents:     map[string]*taskAgentBundle{},
-		llmHealth:      newLLMHealthRegistry(manager.pg),
 	}
+	s.llmHealth, s.llmHealthSync = newLLMHealthRegistry(t.Context(), manager.pg)
+	t.Cleanup(s.FlushLLMHealth)
 	cfg, ok := s.loadLLMConfig()
 	if !ok {
 		t.Fatal("native default did not load")

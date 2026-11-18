@@ -484,7 +484,11 @@ func TestNativeUsedWithoutHoldPreservesOpaqueToolContinuation(t *testing.T) {
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	t.Cleanup(func() {
 		cancelRun()
-		<-server.engine.beginRuntimeDrain()
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelDrain()
+		if err := server.engine.Wait(drainCtx); err != nil {
+			t.Errorf("drain native continuation test: %v", err)
+		}
 	})
 	for range 3 {
 		server.engine.Run(runCtx, task)

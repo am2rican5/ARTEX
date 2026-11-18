@@ -2,16 +2,16 @@ Norma in-tree fork provenance
 =============================
 
 This directory contains the runtime library source and regression tests from
-Norma v0.4.10.
+Norma v0.4.11.
 
 Upstream source:
   Project: https://github.com/BaaRai/Norma
   Canonical module path at that release: github.com/Autumn-27/norma
-  Release: v0.4.10
-  Commit: 4c01427b312a03084461c648cc65ac8c6c73b944
+  Release: v0.4.11
+  Commit: facbfad0e8dcfaa4015522ced21290b148f8a61f
   License: Apache License 2.0 (preserved verbatim in LICENSE)
 
-The v0.4.10 source distribution did not contain an upstream NOTICE file. This
+The v0.4.11 source distribution did not contain an upstream NOTICE file. This
 NOTICE records ARTEX's provenance and modifications; it does not alter the
 Apache License 2.0 terms.
 

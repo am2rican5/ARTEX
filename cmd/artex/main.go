@@ -117,10 +117,15 @@ func run() int {
 		log.Printf("[config] trusted proxies: %v", trusted)
 	}
 	srv := server.New(ctx, mgr, skillDir, *dataDir, keyDir, server.WithSecretScrub(), server.WithTrustedProxies(trusted))
+	// ReadTimeout bounds how long the request headers and body may take to arrive.
+	// It does not limit how long a handler runs, so an event stream stays open.
+	// WriteTimeout is left unset: a write deadline would cut that stream.
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
 	}
 
 	go func() {
@@ -134,15 +139,20 @@ func run() int {
 	<-ctx.Done()
 
 	log.Println("shutting down...")
+	// Stop HTTP admission before joining any detached model or tool work.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	_ = httpSrv.Shutdown(shutdownCtx)
+	httpErr := httpSrv.Shutdown(shutdownCtx)
 	cancel()
+	if httpErr != nil {
+		log.Printf("http shutdown: %v", httpErr)
+	}
 	taskDrainCtx, cancelTaskDrain := context.WithTimeout(context.Background(), 30*time.Second)
 	taskDrainErr := srv.DrainTaskRuntimes(taskDrainCtx)
 	cancelTaskDrain()
+	// Flush breaker writes after the task joins and before closing PostgreSQL.
+	srv.FlushLLMHealth()
 	if taskDrainErr != nil {
-		// A timed-out task runtime may still be persisting its final state. Leave
-		// PostgreSQL open rather than racing that commit with Manager.Close.
+		// A timed-out runtime may still be persisting its final state.
 		managerClosed = true
 		log.Printf("drain task runtimes: %v", taskDrainErr)
 		return 1
@@ -151,6 +161,8 @@ func run() int {
 	managerClosed = true
 	if closeErr != nil {
 		log.Printf("close stores: %v", closeErr)
+	}
+	if httpErr != nil || closeErr != nil {
 		return 1
 	}
 	return 0

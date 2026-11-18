@@ -11,7 +11,7 @@ No OMP/Bun process, broker, `auth.json`, npm package, Claude CLI, or Codex CLI i
 
 ## Status and limits
 
-This integration is based on protocol behavior pinned from OMP commit `1bdbf6d242d99ca62bdf2feeff4519ff992f647d`. ARTEX's in-process Norma fork is pinned to Norma v0.4.10 commit `4c01427b312a03084461c648cc65ac8c6c73b944` under Apache-2.0. These pins make the implementation reviewable; they do not make the providers' private or legacy protocols stable.
+This integration is based on protocol behavior pinned from OMP commit `1bdbf6d242d99ca62bdf2feeff4519ff992f647d`. ARTEX's in-process Norma fork is pinned to Norma v0.4.11 commit `facbfad0e8dcfaa4015522ced21290b148f8a61f` under Apache-2.0. These pins make the implementation reviewable; they do not make the providers' private or legacy protocols stable.
 
 The authorization issuers, client identity, callback URI, model origins, and required request identity are fixed in the native adapters. A native profile cannot set an arbitrary Base URL or User-Agent. Use an API-key or Ollama profile when a custom endpoint or request identity is required.
 
@@ -47,7 +47,7 @@ Container `0.0.0.0` is necessary because Docker port publishing targets the cont
 
 ARTEX still creates its in-container callback listener lazily when **Connect new account** or **Reauthenticate** starts, and removes it when no attempt remains. Docker itself reserves the two host mappings for the life of the container.
 
-Normal shutdown budgets 10 seconds for HTTP shutdown, then 30 seconds to cancel and settle task, main-agent, and side-question runtimes while PostgreSQL remains open, then 60 seconds for native/auth close and critical credential persistence. Individual authorization HTTP work is bounded at 30 seconds inside that final stage. The normal maximum is therefore 100 seconds, within the two-minute Compose grace period.
+Normal shutdown budgets 10 seconds for HTTP shutdown, then 30 seconds to cancel and settle task, main-agent, and side-question runtimes while PostgreSQL remains open, up to 5 seconds to flush circuit-breaker health, then 60 seconds for native/auth close and critical credential persistence. Individual authorization HTTP work is bounded at 30 seconds inside that final stage. The normal maximum is therefore 105 seconds, within the two-minute Compose grace period.
 
 Docker can still force-terminate a process that overruns the grace period or is killed directly. Durable native-use markers protect the next restart: ARTEX pauses an unfinished task with an uncertain native outcome instead of issuing another model request automatically.
 
@@ -163,7 +163,7 @@ Provider authentication failures use subscription-specific error codes and do no
 
 A usable native-credential backup is a matched set:
 
-1. the PostgreSQL dump, including `llm_credentials`, `llm_profiles`, bindings, the ARTEX password hash, and the task `native_used` / `native_recovery_hold` recovery markers added by `0007_native_task_recovery.sql`;
+1. the PostgreSQL dump, including `llm_credentials`, `llm_profiles`, bindings, the ARTEX password hash, and the task `native_used` / `native_recovery_hold` recovery markers added by `0009_native_task_recovery.sql`;
 2. the exact secret-encryption key that sealed that database: either `keys/secret.key` or the deployment's `ARTEX_SECRET_KEY` value;
 3. the JWT signing key at `keys/jwt.key` and the same `ARTEX_JWT_KEY_DIR` layout/settings;
 4. optionally, the runtime `data/` tree if the rest of the ARTEX state is required.
@@ -176,6 +176,202 @@ ARTEX refuses to generate a new secret key over encrypted rows and refuses to st
 
 No `auth.json`, broker state, npm directory, or native CLI installation belongs in this backup.
 
+## Database upgrade paths
+
+Migration versions are append-only and validated by filename and SHA-256 checksum. Use exactly one of these paths:
+
+- **Fresh database:** start the new binary normally. It applies migrations `0001` through `0009` in order.
+- **Standard upstream database:** if `schema_migrations` already records upstream `0006_activity_outbox.sql` and `0007_finding_report_state.sql`, start the new binary normally. It applies native migrations `0008_llm_oauth_credentials.sql` and `0009_native_task_recovery.sql`. Do not run the maintenance procedure below.
+- **Early experimental native database:** a binary built from native commit `bf23bce26baad3c62b88e10bca8edeb6b4a747ca` recorded the native migrations under versions `0006` and `0007`, before upstream assigned those versions. Follow the offline procedure below once.
+
+Do not infer the third case from the presence of native tables. Inspect the ledger:
+
+```sql
+SELECT version, name, checksum, applied_at
+FROM schema_migrations
+ORDER BY version;
+```
+
+The early-native procedure applies **only** when versions 6 and 7 are exactly:
+
+| Version | Name | SHA-256 |
+|---|---|---|
+| 6 | `0006_llm_oauth_credentials.sql` | `e3aa3abecde97b42924aa96adb0da44329bbb33e5b7f0e1b4339b3660092e71c` |
+| 7 | `0007_native_task_recovery.sql` | `ad9d901f673b765cf796d4185e9dfa5af65f3cb1da99c369be837e996111f1ad` |
+
+If either row differs, stop. In particular, upstream names at versions 6 and 7 identify the standard path, not an early-native database. Never edit the expected values to make an unfamiliar ledger pass.
+
+### One-time early-native ledger transition
+
+1. Stop every ARTEX application instance while leaving PostgreSQL available. For the opt-in Compose deployment:
+
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.oauth.yml stop artex
+   ```
+
+2. Create and validate a database backup. Compose deployments can use `scripts/backup.sh --with-data`; host-native deployments must take an equivalent PostgreSQL dump and preserve any required runtime data. Separately preserve `keys/secret.key` (or the managed `ARTEX_SECRET_KEY`) and `keys/jwt.key`. Do not proceed without a restorable backup.
+3. From the new checkout, verify that all four migration files are the exact release inputs:
+
+   ```text
+   $ shasum -a 256 db/migrations/0006_activity_outbox.sql db/migrations/0007_finding_report_state.sql db/migrations/0008_llm_oauth_credentials.sql db/migrations/0009_native_task_recovery.sql
+   a320b7788c22a8acb8493885a69c06101b826649c5ad1bcce4f1fbda58283687  db/migrations/0006_activity_outbox.sql
+   f224b62872f88e0182edb8153051b6016dec82492cc17bda229d768450724686  db/migrations/0007_finding_report_state.sql
+   e3aa3abecde97b42924aa96adb0da44329bbb33e5b7f0e1b4339b3660092e71c  db/migrations/0008_llm_oauth_credentials.sql
+   ad9d901f673b765cf796d4185e9dfa5af65f3cb1da99c369be837e996111f1ad  db/migrations/0009_native_task_recovery.sql
+   ```
+
+   Any mismatch means this procedure does not match the target binary; stop and use that release's instructions.
+4. Run the following SQL in one `psql` session. For Compose, use:
+
+   ```bash
+   docker compose exec -T postgres sh -c \
+     'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+   \set ON_ERROR_STOP on
+   SELECT pg_advisory_lock(7337741001);
+   BEGIN;
+   LOCK TABLE schema_migrations IN EXCLUSIVE MODE;
+
+   DO $guard$
+   DECLARE
+       ledger_versions INTEGER[];
+       changed INTEGER;
+   BEGIN
+       SELECT array_agg(version ORDER BY version)
+         INTO ledger_versions
+         FROM schema_migrations;
+       IF ledger_versions IS DISTINCT FROM ARRAY[1,2,3,4,5,6,7]::INTEGER[] THEN
+           RAISE EXCEPTION 'expected exactly migration versions 1..7, found %', ledger_versions;
+       END IF;
+
+       IF NOT EXISTS (
+           SELECT 1 FROM schema_migrations
+           WHERE version=6
+             AND name='0006_llm_oauth_credentials.sql'
+             AND checksum='e3aa3abecde97b42924aa96adb0da44329bbb33e5b7f0e1b4339b3660092e71c'
+       ) THEN
+           RAISE EXCEPTION 'migration 6 is not the exact early-native credential migration';
+       END IF;
+       IF NOT EXISTS (
+           SELECT 1 FROM schema_migrations
+           WHERE version=7
+             AND name='0007_native_task_recovery.sql'
+             AND checksum='ad9d901f673b765cf796d4185e9dfa5af65f3cb1da99c369be837e996111f1ad'
+       ) THEN
+           RAISE EXCEPTION 'migration 7 is not the exact early-native recovery migration';
+       END IF;
+       IF EXISTS (SELECT 1 FROM schema_migrations WHERE version IN (8,9)) THEN
+           RAISE EXCEPTION 'migration destination version 8 or 9 is already occupied';
+       END IF;
+
+       IF to_regclass('llm_credentials') IS NULL
+          OR NOT EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_schema=current_schema() AND table_name='llm_profiles'
+                AND column_name='auth_mode'
+          )
+          OR NOT EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_schema=current_schema() AND table_name='tasks'
+                AND column_name='native_used'
+          )
+          OR NOT EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_schema=current_schema() AND table_name='tasks'
+                AND column_name='native_recovery_hold'
+          ) THEN
+           RAISE EXCEPTION 'early-native schema objects are incomplete; restore or investigate instead of rewriting the ledger';
+       END IF;
+
+       IF to_regclass('activity_outbox') IS NOT NULL
+          OR EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_schema=current_schema() AND table_name='findings'
+                AND column_name='report_state'
+          ) THEN
+           RAISE EXCEPTION 'canonical upstream 6/7 schema already exists; restore or investigate instead of adopting it';
+       END IF;
+
+       UPDATE schema_migrations
+          SET version=8, name='0008_llm_oauth_credentials.sql'
+        WHERE version=6
+          AND name='0006_llm_oauth_credentials.sql'
+          AND checksum='e3aa3abecde97b42924aa96adb0da44329bbb33e5b7f0e1b4339b3660092e71c';
+       GET DIAGNOSTICS changed = ROW_COUNT;
+       IF changed <> 1 THEN
+           RAISE EXCEPTION 'expected to move exactly one native credential ledger row, moved %', changed;
+       END IF;
+
+       UPDATE schema_migrations
+          SET version=9, name='0009_native_task_recovery.sql'
+        WHERE version=7
+          AND name='0007_native_task_recovery.sql'
+          AND checksum='ad9d901f673b765cf796d4185e9dfa5af65f3cb1da99c369be837e996111f1ad';
+       GET DIAGNOSTICS changed = ROW_COUNT;
+       IF changed <> 1 THEN
+           RAISE EXCEPTION 'expected to move exactly one native recovery ledger row, moved %', changed;
+       END IF;
+   END
+   $guard$;
+
+   CREATE TABLE IF NOT EXISTS activity_outbox (
+       id BIGSERIAL PRIMARY KEY,
+       exploration_id BIGINT NOT NULL,
+       payload JSONB NOT NULL,
+       last_error TEXT,
+       attempts INT NOT NULL DEFAULT 0,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+   );
+   CREATE INDEX IF NOT EXISTS activity_outbox_exploration_idx
+       ON activity_outbox (exploration_id, id);
+
+   ALTER TABLE findings
+       ADD COLUMN IF NOT EXISTS report_state TEXT NOT NULL DEFAULT 'none';
+   CREATE INDEX IF NOT EXISTS idx_findings_report_state
+       ON findings (report_state, created_at DESC);
+
+   INSERT INTO schema_migrations(version, name, checksum)
+   VALUES
+       (6, '0006_activity_outbox.sql',
+        'a320b7788c22a8acb8493885a69c06101b826649c5ad1bcce4f1fbda58283687'),
+       (7, '0007_finding_report_state.sql',
+        'f224b62872f88e0182edb8153051b6016dec82492cc17bda229d768450724686');
+
+   DO $verify$
+   DECLARE
+       ledger_versions INTEGER[];
+   BEGIN
+       SELECT array_agg(version ORDER BY version)
+         INTO ledger_versions
+         FROM schema_migrations;
+       IF ledger_versions IS DISTINCT FROM ARRAY[1,2,3,4,5,6,7,8,9]::INTEGER[] THEN
+           RAISE EXCEPTION 'transition did not produce migration versions 1..9: %', ledger_versions;
+       END IF;
+       IF NOT EXISTS (
+           SELECT 1 FROM schema_migrations
+           WHERE version=8
+             AND name='0008_llm_oauth_credentials.sql'
+             AND checksum='e3aa3abecde97b42924aa96adb0da44329bbb33e5b7f0e1b4339b3660092e71c'
+       ) OR NOT EXISTS (
+           SELECT 1 FROM schema_migrations
+           WHERE version=9
+             AND name='0009_native_task_recovery.sql'
+             AND checksum='ad9d901f673b765cf796d4185e9dfa5af65f3cb1da99c369be837e996111f1ad'
+       ) THEN
+           RAISE EXCEPTION 'native migration rows were not preserved at versions 8 and 9';
+       END IF;
+   END
+   $verify$;
+
+   COMMIT;
+   SELECT pg_advisory_unlock(7337741001);
+   SQL
+   ```
+
+   For a host-native PostgreSQL connection, feed the same SQL body to `psql -X -v ON_ERROR_STOP=1 "$ARTEX_PG_DSN"` instead. The advisory lock is the same lock used by ARTEX startup. `ON_ERROR_STOP` and the enclosing transaction make every guard fail closed: a wrong filename, checksum, version set, occupied destination, or unexpected schema aborts without changing the ledger or schema. The terminated `psql` session also releases the advisory lock. Do not bypass a failure or manually commit an aborted transaction.
+5. Start the new binary. It validates the complete `0001`–`0009` ledger before serving. The transition changes only migration versions/names for the two native rows; their checksums and `applied_at` values are preserved. It does not update `llm_credentials`, profile bindings, encrypted payloads, or either native task flag. Confirm that connected accounts and held tasks match the pre-upgrade deployment before resuming work.
+
+Do not run the new binary against the early-native ledger before this procedure. Startup applies the current schema baseline before validating migration history, so a failed attempt can create the canonical objects and intentionally cause the preflight guard above to refuse automatic adoption. Restore the backup before retrying.
+
 ## Rollback to a native-unaware ARTEX version
 
 Prepare the routing while the current binary still understands native profiles:
@@ -184,8 +380,8 @@ Prepare the routing while the current binary still understands native profiles:
 2. Create or select an explicit API-key or Ollama profile and test it.
 3. Make that non-native profile active. Remove native profiles from every agent/role binding, task profile chain and active task cursor, conversation override, judge/auxiliary binding, and pool target, or replace each binding with the tested non-native profile. Turning pool rotation off is not a substitute for clearing explicit bindings.
 4. Confirm that new work resolves to the non-native profile, then stop ARTEX cleanly. For the opt-in container deployment, use the same two Compose files so the two-minute grace period remains in effect.
-5. Start the older binary only after the routing cutover.
+5. Restore a backup whose migration ledger is compatible with the target older binary, together with that backup's matching encryption and JWT keys, before starting it. The current native-aware ledger contains versions the older binary does not ship, so an image-only downgrade is rejected even after the routing cutover. State recorded after the restored backup is not preserved by this rollback.
 
 Do not downgrade first. Older code that does not understand `auth_mode`, credential bindings, or native terminal errors could treat the profile as unusable and fall through to a global/environment API key or another profile.
 
-Rollback requires no destructive migration, reversal of `0007_native_task_recovery.sql`, or credential-table drop. Preserve the recovery markers, encrypted credential records, and their matching `secret.key`/`ARTEX_SECRET_KEY`; they can remain unused for a later return to a native-aware version. Preserve `jwt.key` as well. Disconnect an account only when local revocation is actually desired, not as a schema-cleanup step.
+Do not delete migration ledger rows or drop credential tables to make an incompatible database appear compatible. Keep the native-aware database backup, its recovery markers and encrypted credential records, and its matching `secret.key`/`ARTEX_SECRET_KEY` for a later return to the native-aware version. Preserve its `jwt.key` as well. Disconnect an account only when local revocation is actually desired, not as a schema-cleanup step.

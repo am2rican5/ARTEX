@@ -17,6 +17,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/internal/norma/llm"
 	"github.com/Autumn-27/artex/internal/norma/transcript"
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 )
 
@@ -157,8 +158,15 @@ func resetLLMFailStreak(taskID string, profileID int64) {
 type taskLLMSelection struct {
 	task      *Task
 	profileID int64
-	revision  int64
-	provider  llm.Provider
+	// healthProfileID is the llm_profiles row whose breaker state the calls on
+	// this selection update. It equals profileID on the task-chain path; a bound
+	// agent or the global provider carries its own id here while profileID stays
+	// 0 (no chain semantics). 0 means "do not report": either there is no
+	// profile (environment-only configuration) or the provider is already the
+	// failover Pool, which updates the registry itself.
+	healthProfileID int64
+	revision        int64
+	provider        llm.Provider
 	// retry holds the retry parameters resolved for the profile selected this time (profile override → global policy → built-in default).
 	// Same-provider safe-window retries follow it, so switching profiles switches the retry cadence.
 	retry agent.RetryConfig
@@ -186,6 +194,24 @@ type taskLLMStreamHooks struct {
 	current    func(context.Context) (taskLLMSelection, error)
 	exhaust    func(taskLLMSelection, error) (db.TaskLLMTransition, error)
 	transition func(taskLLMSelection, db.TaskLLMTransition, error)
+	// recordHealth reports one physical provider attempt to the process-wide
+	// breaker. It keeps /system/llm/ truthful for every selection whose provider
+	// is not already the failover Pool (the chain, a bound agent, the global
+	// profile). Optional: test literals leave it nil and the call sites skip it.
+	recordHealth func(ctx context.Context, profileID int64, stream, committed bool, err error)
+}
+
+// healthIDFor returns the profile whose breaker state a call on this provider
+// should update. It returns 0 when there is no profile, or when the provider is
+// the failover Pool, which records every member attempt itself.
+func healthIDFor(prov llm.Provider, profileID int64) int64 {
+	if profileID == 0 {
+		return 0
+	}
+	if _, pooled := prov.(*llmpool.Pool); pooled {
+		return 0
+	}
+	return profileID
 }
 
 // current resolves the provider this role runs on, by precedence:
@@ -224,6 +250,7 @@ func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, erro
 	if bindingID != nil {
 		if prov, cfg, ok := r.s.providerForProfile(*bindingID); ok {
 			sel.provider, sel.retry = r.s.poolForBinding(*bindingID, prov, cfg), cfg.Retry
+			sel.healthProfileID = healthIDFor(sel.provider, *bindingID)
 			return sel, nil
 		}
 		if selectionErr := r.s.nativeProfileSelectionError(*bindingID); selectionErr != nil {
@@ -251,13 +278,15 @@ func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, erro
 			return sel, fmt.Errorf("LLM profile #%d is missing or invalid", sel.profileID)
 		}
 		sel.provider, sel.retry = prov, cfg.Retry
+		sel.healthProfileID = sel.profileID // chain selections never go through the Pool
 		return sel, nil
 	}
-	prov, cfg, ok := r.s.globalProvider()
+	prov, cfg, id, ok := r.s.globalProviderWithProfile()
 	if !ok {
 		return sel, fmt.Errorf("task %s has no available fallback LLM provider", r.taskID)
 	}
 	sel.provider, sel.retry = prov, cfg.Retry
+	sel.healthProfileID = healthIDFor(prov, id)
 	return sel, nil
 }
 
@@ -325,13 +354,22 @@ func parseTaskID(id string) (int64, error) {
 
 // streamHooks builds the failover/exhaustion callbacks shared by Stream and
 // Complete: how to read the current profile selection, how to mark it quota
-// exhausted, and how to emit a failover transition.
+// exhausted, how to emit a failover transition, and how to report breaker
+// health for providers that are not the failover Pool.
 func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 	return taskLLMStreamHooks{
 		admission: func(ctx context.Context) error {
 			return r.s.ensureNativeTaskAdmission(ctx, r.taskID)
 		},
 		current: func(ctx context.Context) (taskLLMSelection, error) { return r.currentFor(ctx) },
+		recordHealth: func(ctx context.Context, profileID int64, stream, committed bool, err error) {
+			if profileID == 0 || r.s == nil || r.s.llmHealth == nil {
+				return
+			}
+			if tripped, msg := r.s.llmHealth.RecordCall(ctx, profileID, stream, committed, err); tripped {
+				log.Printf("[task-llm] profile #%d breaker tripped: %s", profileID, msg)
+			}
+		},
 		exhaust: func(selection taskLLMSelection, cause error) (db.TaskLLMTransition, error) {
 			taskNum, _ := parseTaskID(r.taskID)
 			transition, err := r.s.m.pg.MarkTaskLLMProfileQuotaExhaustedAtRevision(taskNum, selection.profileID, selection.revision, cause.Error())
@@ -422,6 +460,9 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 			}
 			msg, sr, usage, callErr = selection.provider.Complete(ctx, req)
 			total.Add(usage)
+			if hooks.recordHealth != nil {
+				hooks.recordHealth(ctx, selection.healthProfileID, false, false, callErr)
+			}
 			if callErr != nil && ctx.Err() == nil &&
 				attempt < retries && isRetryableStreamError(callErr) {
 				backoff := backoffOf(attempt)
@@ -563,6 +604,9 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 					if !forward(event) {
 						return
 					}
+				}
+				if hooks.recordHealth != nil {
+					hooks.recordHealth(ctx, selection.healthProfileID, true, committed, streamErr)
 				}
 				if streamErr != nil && !committed {
 					// A failed uncommitted attempt delivers none of its events (they are
@@ -802,22 +846,6 @@ func (s *Server) taskAgentBindingID(agentKey string) (*int64, error) {
 	return taskAgent.LLMProfileID, nil
 }
 
-// agentBindingProvider resolves the profile a role is explicitly bound to
-// (agents.llm_profile_id) — the highest-precedence level for task agents. Its
-// legacy bool result cannot express a native selection failure, so callers that
-// may fall through must check nativeProfileSelectionError first.
-func (s *Server) agentBindingProvider(agentKey string) (llm.Provider, agent.Config, bool) {
-	id, err := s.taskAgentBindingID(agentKey)
-	if err != nil || id == nil {
-		return nil, agent.Config{}, false
-	}
-	prov, cfg, ok := s.providerForProfile(*id)
-	if !ok {
-		return nil, agent.Config{}, false
-	}
-	return s.poolForBinding(*id, prov, cfg), cfg, true
-}
-
 // globalProvider returns the process-wide provider (persisted active profile or
 // environment config) — the last resort once a role has neither a binding nor a
 // task chain.
@@ -828,6 +856,19 @@ func (s *Server) globalProvider() (llm.Provider, agent.Config, bool) {
 		return nil, agent.Config{}, false
 	}
 	return s.llmProv, s.llmCfg, true
+}
+
+// globalProviderWithProfile is globalProvider plus the llm_profiles row the
+// provider was built from (0 for an environment-only configuration). The id is
+// read under the same lock as the provider so the pair cannot be mixed across
+// an applyLLM rebuild.
+func (s *Server) globalProviderWithProfile() (llm.Provider, agent.Config, int64, bool) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	if !s.llmOn || s.llmProv == nil {
+		return nil, agent.Config{}, 0, false
+	}
+	return s.llmProv, s.llmCfg, s.llmHealthProfileID, true
 }
 
 // taskRuntimeAvailable reports whether every listed role can resolve a provider
@@ -848,10 +889,7 @@ func (s *Server) taskRuntimeAvailable(t *Task, agentKeys ...string) bool {
 		_, _, unboundReady = s.globalProvider()
 	}
 	for _, key := range agentKeys {
-		// Readiness answers whether a configured chain/global provider can serve
-		// the role. A binding lookup failure is enforced later by currentFor at
-		// physical dispatch; it must not hide an otherwise configured global
-		// provider from availability/status calculations.
+		// A binding lookup error is enforced at physical dispatch, not readiness.
 		bindingID, _ := s.taskAgentBindingID(key)
 		if bindingID != nil {
 			if _, _, ok := s.providerForProfile(*bindingID); ok {

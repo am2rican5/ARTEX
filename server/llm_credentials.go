@@ -14,7 +14,7 @@ import (
 // session without retaining the bearer token itself.
 func (s *Server) credentialOwner(r *http.Request) (string, bool) {
 	token := extractToken(r)
-	if token == "" || !verifyJWT(token, s.jwtKey) {
+	if token == "" || !s.sessionOK(token) {
 		return "", false
 	}
 	digest := sha256.Sum256([]byte(token))
@@ -75,7 +75,7 @@ func (s *Server) loginLLMCredential(w http.ResponseWriter, r *http.Request) {
 		Provider     string `json:"provider"`
 		CredentialID *int64 `json:"credential_id"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeSubscriptionError(w, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "invalid credential login request"})
 		return
 	}
@@ -112,7 +112,7 @@ func (s *Server) submitLLMCredentialAttempt(w http.ResponseWriter, r *http.Reque
 	var body struct {
 		RedirectURL string `json:"redirect_url"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeSubscriptionError(w, &subscription.Error{Code: subscription.CodeInvalidRequest, Message: "invalid authorization redirect submission"})
 		return
 	}

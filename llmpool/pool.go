@@ -104,13 +104,12 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 				}
 			}
 			if failed == nil {
-				p.health.Pass(m.ID) // completed (or failed in a non-failover way)
+				p.health.RecordCall(ctx, m.ID, true, false, nil) // completed: Pass
 				return
 			}
 			lastErr = failed
-			hard := isHardFailure(failed)
-			if p.health.Trip(m.ID, trimErr(failed), hard) {
-				log.Printf("[llmpool] profile %q(%s) breaker tripped: %s", m.Name, m.Model, trimErr(failed))
+			if tripped, msg := p.health.RecordCall(ctx, m.ID, true, false, failed); tripped {
+				log.Printf("[llmpool] profile %q(%s) breaker tripped: %s", m.Name, m.Model, msg)
 			}
 			if i+1 < len(order) {
 				n := order[i+1]
@@ -138,7 +137,7 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 	for i, m := range order {
 		msg, sr, usage, err := m.Prov.Complete(ctx, req)
 		if err == nil {
-			p.health.Pass(m.ID)
+			p.health.RecordCall(ctx, m.ID, false, false, nil) // Pass
 			return msg, sr, usage, nil
 		}
 		if autoFallbackDisabled(err) {
@@ -147,15 +146,15 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 		}
 		if !shouldFailover(ctx, err) {
 			// Non-failover error (e.g. ctx cancel, deterministic 4xx): surface as-is
-			// without tripping health, matching Stream's non-failover path.
-			p.health.Pass(m.ID)
+			// without tripping health. RecordCall clears the state on an atomic
+			// call, matching the historical Pass here.
+			p.health.RecordCall(ctx, m.ID, false, false, err)
 			return llm.Message{}, "", llm.Usage{}, err
 		}
 		failedUsage.Add(usage)
 		lastErr = err
-		hard := isHardFailure(err)
-		if p.health.Trip(m.ID, trimErr(err), hard) {
-			log.Printf("[llmpool] profile %q(%s) breaker tripped: %s", m.Name, m.Model, trimErr(err))
+		if tripped, msg := p.health.RecordCall(ctx, m.ID, false, false, err); tripped {
+			log.Printf("[llmpool] profile %q(%s) breaker tripped: %s", m.Name, m.Model, msg)
 		}
 		if i+1 < len(order) {
 			n := order[i+1]
